@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/schema.json
+
+name: "@NAME@"
+arch: "@ARCH@"
+platform: "linux"
+version: "@VERSION@"
+section: "admin"
+priority: "optional"
+maintainer: "agentbox"
+description: |
+  Agentbox - Zero-image Podman AI sandboxes written in Rust.
+  Statically linked binary.
+vendor: "agentbox"
+license: "GPL-3.0"
+
+contents:
+  - src: ./usr/bin/agentbox
+    dst: /usr/bin/agentbox
+  - src: ./usr/share/bash-completion/completions/agentbox.bash
+    dst: /usr/share/bash-completion/completions/agentbox.bash
+  - src: ./usr/share/fish/vendor_completions.d/agentbox.fish
+    dst: /usr/share/fish/vendor_completions.d/agentbox.fish
+  - src: ./usr/share/zsh/site-functions/_agentbox
+    dst: /usr/share/zsh/site-functions/_agentbox

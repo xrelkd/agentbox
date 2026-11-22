@@ -1,0 +1,57 @@
+{
+  name,
+  version,
+  lib,
+  nfpm,
+  agentbox-static,
+  pkgs,
+  stdenv,
+  packager ? "deb",
+  arch ? "amd64",
+}:
+
+let
+  nfpmConfig = pkgs.replaceVars ./nfpm.yaml {
+    NAME = name;
+    VERSION = version;
+    ARCH = arch;
+  };
+in
+stdenv.mkDerivation {
+  pname = "${name}-${packager}";
+  inherit version;
+
+  nativeBuildInputs = [ nfpm ];
+
+  dontUnpack = true;
+  dontConfigure = true;
+  dontBuild = true;
+
+  installPhase = ''
+    runHook preInstall
+
+    staging=$(mktemp -d)
+    mkdir -p "$staging/usr/bin"
+    mkdir -p "$staging/usr/share/bash-completion/completions"
+    mkdir -p "$staging/usr/share/fish/vendor_completions.d"
+    mkdir -p "$staging/usr/share/zsh/site-functions"
+
+    cp ${agentbox-static}/bin/agentbox "$staging/usr/bin/"
+
+    cp ${agentbox-static}/share/bash-completion/completions/* "$staging/usr/share/bash-completion/completions/"
+    cp ${agentbox-static}/share/fish/vendor_completions.d/* "$staging/usr/share/fish/vendor_completions.d/"
+    cp ${agentbox-static}/share/zsh/site-functions/* "$staging/usr/share/zsh/site-functions/"
+
+    mkdir -p $out
+    cd "$staging"
+    nfpm package -f ${nfpmConfig} --packager ${packager} --target "$out"
+
+    runHook postInstall
+  '';
+
+  meta = with lib; {
+    description = "Zero-image Podman AI sandboxes written in Rust (statically linked, ${packager} package)";
+    license = licenses.gpl3Only;
+    platforms = platforms.linux;
+  };
+}
