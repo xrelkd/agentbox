@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 use crate::error::{self, Result};
 
@@ -577,17 +577,22 @@ impl ContainerSpecBuilder {
 
     /// Validates required fields and produces a [`ContainerSpec`].
     pub fn build(self) -> Result<ContainerSpec> {
-        let missing = |field| error::Error::MissingField { field };
         Ok(ContainerSpec {
-            name: self.name.ok_or_else(|| missing("name"))?,
-            hostname: self.hostname.ok_or_else(|| missing("hostname"))?,
-            workdir: self.workdir.ok_or_else(|| missing("workdir"))?,
-            uid: self.uid.ok_or_else(|| missing("uid"))?,
-            gid: self.gid.ok_or_else(|| missing("gid"))?,
-            rootfs: self.rootfs.ok_or_else(|| missing("rootfs"))?,
+            name: self.name.with_context(|| error::MissingFieldSnafu { field: "name" })?,
+            hostname: self
+                .hostname
+                .with_context(|| error::MissingFieldSnafu { field: "hostname" })?,
+            workdir: self.workdir.with_context(|| error::MissingFieldSnafu { field: "workdir" })?,
+            uid: self.uid.with_context(|| error::MissingFieldSnafu { field: "uid" })?,
+            gid: self.gid.with_context(|| error::MissingFieldSnafu { field: "gid" })?,
+            rootfs: self.rootfs.with_context(|| error::MissingFieldSnafu { field: "rootfs" })?,
             rootfs_overlay: self.rootfs_overlay,
-            init_shell: self.init_shell.ok_or_else(|| missing("init_shell"))?,
-            init_script: self.init_script.ok_or_else(|| missing("init_script"))?,
+            init_shell: self
+                .init_shell
+                .with_context(|| error::MissingFieldSnafu { field: "init_shell" })?,
+            init_script: self
+                .init_script
+                .with_context(|| error::MissingFieldSnafu { field: "init_script" })?,
             read_only: self.read_only,
             no_new_privileges: self.no_new_privileges,
             drop_all_caps: self.drop_all_caps,

@@ -13,7 +13,7 @@ use crate::error::{self, Result};
 pub const DEFAULT_CONFIG_TEMPLATE: &[u8] = include_bytes!("default.yaml");
 
 /// Top-level agentbox configuration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// General runtime paths and process settings.
@@ -35,7 +35,7 @@ pub struct Config {
 }
 
 /// General runtime paths and process settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// Host path to the Nix-produced AI environment, resolved through symlinks.
@@ -55,7 +55,7 @@ pub struct GeneralConfig {
 }
 
 /// Container isolation, resources, and rootfs settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -85,7 +85,7 @@ pub struct ContainerConfig {
 }
 
 /// Nix store/daemon and kernel-module mount settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct NixConfig {
     /// Mount the Nix daemon socket, profiles, and `/etc/nix` when the socket
@@ -112,7 +112,7 @@ pub struct NixConfig {
 }
 
 /// A single host-to-container mount declaration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct MountEntry {
@@ -127,7 +127,7 @@ pub struct MountEntry {
 }
 
 /// Host-to-container mount declarations.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MountsConfig {
     /// State directories created on the host and mounted read-write.
@@ -139,7 +139,7 @@ pub struct MountsConfig {
 }
 
 /// Environment variables injected into the container.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EnvironmentConfig {
     /// Container `PATH`.
@@ -165,7 +165,7 @@ pub struct EnvironmentConfig {
 }
 
 /// SOPS secret files injected as environment variables.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SecretsConfig {
     /// Host base directory containing SOPS secret files.
@@ -175,7 +175,7 @@ pub struct SecretsConfig {
 }
 
 /// `OpenCode` server startup and polling settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
     /// tmux session created when the container starts.
@@ -191,7 +191,7 @@ pub struct ServerConfig {
 }
 
 /// Agent command and default tmux session name.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct AgentConfig {

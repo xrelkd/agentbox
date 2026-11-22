@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 use crate::{
     config::{self, Config},
@@ -94,7 +94,7 @@ impl App {
             .config
             .agents
             .get(agent_name)
-            .ok_or_else(|| error::Error::UnknownAgent { name: agent_name.to_owned() })?;
+            .with_context(|| error::UnknownAgentSnafu { name: agent_name.to_owned() })?;
         let session = session.unwrap_or_else(|| agent.default_session.clone());
         let command = agent.command.clone();
 

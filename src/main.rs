@@ -10,13 +10,14 @@ use std::{env, path::PathBuf, process::ExitCode};
 
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
+use snafu::OptionExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::{
     app::App,
     cli::{Cli, Command, ConfigAction},
     config::Config,
-    error::{Error, Result},
+    error::Result,
     workspace::ProjectIdentity,
 };
 
@@ -47,7 +48,7 @@ fn init_tracing(verbose: u8) {
 }
 
 fn run(cli: &Cli) -> Result<()> {
-    let home = env::var_os("HOME").map(PathBuf::from).ok_or(Error::HomeNotFound)?;
+    let home = env::var_os("HOME").map(PathBuf::from).with_context(|| error::HomeNotFoundSnafu)?;
     let config_path = Config::resolve_path(cli.config.as_deref(), &home);
     let command = cli.selected_command();
 
