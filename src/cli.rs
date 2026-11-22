@@ -1,7 +1,15 @@
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
-use clap::{ArgAction, Parser, Subcommand};
-use clap_complete::Shell;
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
+use snafu::OptionExt;
+
+use crate::{
+    app::App,
+    config::Config,
+    error::{self, Result},
+    workspace::ProjectIdentity,
+};
 
 /// Command-line interface for agentbox.
 #[derive(Debug, Parser)]
@@ -16,7 +24,7 @@ pub struct Cli {
     pub verbose: u8,
 
     /// Path to a YAML configuration file.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", env = "AGENTBOX_CONFIG")]
     pub config: Option<PathBuf>,
 
     /// Subcommand to run; defaults to `opencode`.
@@ -101,11 +109,57 @@ impl Cli {
     /// Returns the selected command, defaulting to `opencode`.
     #[inline]
     pub fn selected_command(&self) -> Command { self.command.clone().unwrap_or(Command::Opencode) }
+
+    /// Executes the selected command.
+    pub fn run(&self) -> Result<()> {
+        let home =
+            env::var_os("HOME").map(PathBuf::from).with_context(|| error::HomeNotFoundSnafu)?;
+        let config_path = Config::resolve_path(self.config.as_deref(), &home);
+        let command = self.selected_command();
+
+        if let Command::Completions { shell } = &command {
+            let mut command = Self::command();
+            generate(*shell, &mut command, "agentbox", &mut std::io::stdout());
+            return Ok(());
+        }
+
+        if let Command::Config { action } = &command {
+            return match action {
+                ConfigAction::Init { force } => Config::write_default(&config_path, *force),
+                ConfigAction::Path => {
+                    println!("{}", config_path.display());
+                    Ok(())
+                }
+            };
+        }
+
+        let config = Config::load(&config_path)?;
+        let identity = ProjectIdentity::resolve(&home, &config)?;
+        let app = App::new(config, identity, home);
+
+        match command {
+            Command::Opencode => app.opencode(),
+            Command::OcTui { session } => app.agent("oc-tui", session),
+            Command::Claude { session } => app.agent("claude", session),
+            Command::Gemini { session } => app.agent("gemini", session),
+            Command::Shell { session } => app.shell(session),
+            Command::Sessions => app.sessions(),
+            Command::Tmp => {
+                app.temporary_dir();
+                Ok(())
+            }
+            Command::Stop => app.stop(),
+            Command::List => app.list(),
+            Command::Completions { .. } | Command::Config { .. } => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use std::ffi::OsStr;
+
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, Command, ConfigAction};
 
@@ -128,6 +182,16 @@ mod tests {
 
         let list = Cli::try_parse_from(["agentbox", "ls"]).expect("parse ls");
         assert!(matches!(list.selected_command(), Command::List));
+    }
+
+    #[test]
+    fn config_option_reads_env_variable() {
+        let command = Cli::command();
+        let config = command
+            .get_arguments()
+            .find(|argument| argument.get_long() == Some("config"))
+            .expect("config argument should exist");
+        assert_eq!(config.get_env(), Some(OsStr::new("AGENTBOX_CONFIG")));
     }
 
     #[test]
