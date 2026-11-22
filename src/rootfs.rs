@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs::{self, Permissions},
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
@@ -16,7 +16,8 @@ use crate::{
 /// shell.
 pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) -> Result<String> {
     let home = &identity.host.home;
-    create_dir_all(&identity.home_dir)?;
+    create_private_dir(&identity.meta_dir)?;
+    create_private_dir(&identity.home_dir)?;
     for mount in &config.mounts.state_dirs {
         let host = config::expand_path(Path::new(&mount.host), home);
         create_dir_all(&host)?;
@@ -32,9 +33,7 @@ pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) 
         create_persistent_home_path(&identity.home_dir, &mount.container, home, false)?;
     }
 
-    create_dir_all(&identity.tmp_dir)?;
-    fs::set_permissions(&identity.tmp_dir, fs::Permissions::from_mode(0o1777))
-        .with_context(|_| error::SetPermissionsSnafu { path: identity.tmp_dir.clone() })?;
+    create_private_dir(&identity.tmp_dir)?;
 
     let rootfs = &identity.rootfs_dir;
     let workdir = Path::new(&config.container.workdir);
@@ -51,19 +50,19 @@ pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) 
     }
 
     let env_mount = config.general.ai_env_mount_path.trim_end_matches('/');
-    ensure_symlink(rootfs.join("bin/sh"), PathBuf::from(format!("{env_mount}/bin/sh")))?;
-    ensure_symlink(rootfs.join("usr/bin/env"), PathBuf::from(format!("{env_mount}/bin/env")))?;
+    ensure_symlink(rootfs.join("bin/sh"), &PathBuf::from(format!("{env_mount}/bin/sh")))?;
+    ensure_symlink(rootfs.join("usr/bin/env"), &PathBuf::from(format!("{env_mount}/bin/env")))?;
     ensure_symlink(
         rootfs.join("etc/ssl/certs/ca-bundle.crt"),
-        PathBuf::from(format!("{env_mount}/etc/ssl/certs/ca-bundle.crt")),
+        &PathBuf::from(format!("{env_mount}/etc/ssl/certs/ca-bundle.crt")),
     )?;
     ensure_symlink(
         rootfs.join("etc/protocols"),
-        PathBuf::from(format!("{env_mount}/etc/protocols")),
+        &PathBuf::from(format!("{env_mount}/etc/protocols")),
     )?;
     ensure_symlink(
         rootfs.join("etc/services"),
-        PathBuf::from(format!("{env_mount}/etc/services")),
+        &PathBuf::from(format!("{env_mount}/etc/services")),
     )?;
 
     let shell = select_shell(config, ai_env_path, env_mount);
@@ -142,6 +141,12 @@ fn create_dir_all(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|_| error::CreateDirSnafu { path: path.to_path_buf() })
 }
 
+fn create_private_dir(path: &Path) -> Result<()> {
+    create_dir_all(path)?;
+    fs::set_permissions(path, Permissions::from_mode(0o700))
+        .with_context(|_| error::SetPermissionsSnafu { path: path.to_path_buf() })
+}
+
 fn create_persistent_home_path(
     home_dir: &Path,
     raw_container_path: &str,
@@ -171,18 +176,27 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).with_context(|_| error::WriteFileSnafu { path: path.to_path_buf() })
 }
 
-fn ensure_symlink(link: PathBuf, target: PathBuf) -> Result<()> {
+fn ensure_symlink(link: PathBuf, target: &Path) -> Result<()> {
     if let Ok(existing) = fs::read_link(&link)
         && existing == target
     {
         return Ok(());
     }
 
-    if link.exists() || fs::symlink_metadata(&link).is_ok() {
-        fs::remove_file(&link).with_context(|_| error::RemoveFileSnafu { path: link.clone() })?;
+    let name = link
+        .file_name()
+        .map_or_else(|| "symlink".to_owned(), |value| value.to_string_lossy().into_owned());
+    let temporary = link.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    if fs::symlink_metadata(&temporary).is_ok() {
+        fs::remove_file(&temporary)
+            .with_context(|_| error::RemoveFileSnafu { path: temporary.clone() })?;
     }
-
-    symlink(&target, &link).with_context(|_| error::CreateSymlinkSnafu { link, target })
+    symlink(target, &temporary).with_context(|_| error::CreateSymlinkSnafu {
+        link: temporary.clone(),
+        target: target.to_path_buf(),
+    })?;
+    fs::rename(&temporary, &link)
+        .with_context(|_| error::RenameFileSnafu { from: temporary, to: link })
 }
 
 #[cfg(test)]

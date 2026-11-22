@@ -116,13 +116,18 @@ pub fn sanitize_project_name(name: &str) -> String {
     if filtered.is_empty() { "project".into() } else { filtered }
 }
 
-/// Rejects configured forbidden directories after symlink resolution.
+/// Rejects configured forbidden directories and their descendants after
+/// symlink resolution.
 pub fn validate_forbidden_dir(project_dir: &Path, home: &Path, config: &Config) -> Result<()> {
+    snafu::ensure!(
+        project_dir != Path::new("/"),
+        error::ForbiddenDirectorySnafu { path: project_dir.to_path_buf() }
+    );
     for raw in &config.general.forbidden_dirs {
         let expanded = config::expand_path(Path::new(raw), home);
         let forbidden = fs::canonicalize(&expanded).unwrap_or(expanded);
         snafu::ensure!(
-            project_dir != forbidden,
+            !project_dir.starts_with(&forbidden),
             error::ForbiddenDirectorySnafu { path: project_dir.to_path_buf() }
         );
     }
@@ -204,13 +209,19 @@ mod tests {
         let project = root.join("project");
         fs::create_dir_all(&project).expect("create project");
         let canonical = fs::canonicalize(&project).expect("canonicalize project");
-        let config = Config::default();
+        let mut config = Config::default();
+        config.general.forbidden_dirs.clear();
 
         assert!(validate_forbidden_dir(&canonical, Path::new("/home/test"), &config).is_ok());
 
-        let mut strict = config;
-        strict.general.forbidden_dirs = vec![canonical.to_string_lossy().into_owned()];
-        assert!(validate_forbidden_dir(&canonical, Path::new("/home/test"), &strict).is_err());
+        config.general.forbidden_dirs = vec![canonical.to_string_lossy().into_owned()];
+        assert!(validate_forbidden_dir(&canonical, Path::new("/home/test"), &config).is_err());
+
+        config.general.forbidden_dirs = vec![root.to_string_lossy().into_owned()];
+        assert!(validate_forbidden_dir(&canonical, Path::new("/home/test"), &config).is_err());
+
+        config.general.forbidden_dirs.clear();
+        assert!(validate_forbidden_dir(Path::new("/"), Path::new("/home/test"), &config).is_err());
 
         fs::remove_dir_all(root).expect("cleanup");
     }

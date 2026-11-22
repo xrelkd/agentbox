@@ -92,7 +92,7 @@ pub fn render_config(config: &Config) -> Result<String> {
         .get("opencode")
         .and_then(|agent| agent.serve.as_ref())
         .with_context(|| error::AgentHasNoServeSnafu { name: "opencode".to_owned() })?;
-    let mut arguments = config::split_command(&serve.command);
+    let mut arguments = config::split_command(&serve.command)?;
     ensure!(
         !arguments.is_empty(),
         error::InvalidConfigSnafu { message: "agents.opencode.serve.command is empty".to_owned() }

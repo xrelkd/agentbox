@@ -19,8 +19,8 @@ general:
   container_prefix: "agentbox"
   # Host base directory used for home, temporary, and metadata directories.
   runtime_base_dir: "/tmp"
-  # Project directories that agentbox refuses to run from.
-  forbidden_dirs: ["/", "/tmp"]
+  # Project directory prefixes that agentbox refuses to run from.
+  forbidden_dirs: ["/tmp"]
   # Preferred shell inside the container; falls back to bash if unavailable.
   shell: "/run/ai-env/bin/zsh"
   # Agent used when no command is given. `shell` opens an interactive shell.
@@ -47,6 +47,18 @@ container:
   pids_limit: 1024
   # Container memory limit passed to Podman.
   memory_limit: "12g"
+  # Container memory-plus-swap limit; null lets Podman pick its default.
+  memory_swap: null
+  # Container CPU quota; null disables the limit.
+  cpus: "2"
+  # Additional container ulimits.
+  ulimits:
+    core: "0"
+    nofile: "4096:8192"
+  # Inherit host proxy environment variables into the container.
+  inherit_proxy: false
+  # Size of the /tmp tmpfs.
+  tmp_size: "2g"
   # Size of the /var/tmp tmpfs.
   var_tmp_size: "2g"
   # Mount the generated root filesystem as an overlay.
@@ -65,12 +77,13 @@ nix:
   # Host /etc/nix directory.
   etc_nix_dir: "/etc/nix"
   # Mount matching host kernel modules when available.
-  mount_kernel_modules: true
+  mount_kernel_modules: false
   # Host directory containing kernel module version directories.
   kernel_modules_dir: "/run/current-system/kernel-modules/lib/modules"
   # Container directory where kernel modules are mounted.
   kernel_modules_mount_dir: "/lib/modules"
-  # Host Nix configuration directory created and mounted read-only.
+  # Nix configuration directory copied into the per-project home and mounted
+  # read-only; the real host directory is never exposed to the container.
   host_config_dir: "~/.config/nix"
   # Host Nix cache directory created before the container starts.
   host_cache_dir: "~/.cache/nix"
@@ -79,20 +92,36 @@ nix:
 # The per-project persistent home is mounted first at $HOME; entries below are
 # mounted on top of it. `agentbox stop` keeps it unless --purge-home is given.
 mounts:
-  # State directories created on the host and mounted read-write.
+  # Agent state directories. Executable configuration is mounted read-only;
+  # only known data directories are writable. Parent directories must come
+  # before their writable children. Override these entries if your tools need
+  # additional writable state.
   state_dirs:
     - host: "~/.agents"
       container: "~/.agents"
-    - host: "~/.config/opencode"
-      container: "~/.config/opencode"
-    - host: "~/.local/share/opencode"
-      container: "~/.local/share/opencode"
-    - host: "~/.local/state/opencode"
-      container: "~/.local/state/opencode"
+      read_only: true
     - host: "~/.claude"
       container: "~/.claude"
+      read_only: true
+    - host: "~/.claude/projects"
+      container: "~/.claude/projects"
+    - host: "~/.claude/todos"
+      container: "~/.claude/todos"
+    - host: "~/.config/opencode"
+      container: "~/.config/opencode"
+      read_only: true
+    - host: "~/.local/share/opencode"
+      container: "~/.local/share/opencode"
+      read_only: true
+    - host: "~/.local/state/opencode"
+      container: "~/.local/state/opencode"
     - host: "~/.gemini"
       container: "~/.gemini"
+      read_only: true
+    - host: "~/.gemini/history"
+      container: "~/.gemini/history"
+    - host: "~/.gemini/tmp"
+      container: "~/.gemini/tmp"
   # Tool/config paths mounted read-only when present on the host.
   optional_ro_mounts:
     - host: "~/.local/bin"
@@ -162,12 +191,9 @@ server:
   serve_port: 4096
   # Host used by readiness probes inside the container.
   serve_host: "127.0.0.1"
-  # Address the server listens on inside the container. Must not be loopback
-  # when publish_port is enabled, or the host mapping cannot reach it.
-  listen_host: "0.0.0.0"
-  # Publish serve_port on a random host loopback port only; never expose it to
-  # networks outside the host.
-  publish_port: true
+  # Address the server listens on inside the container. No host port is
+  # published; the server is only reachable from within the container.
+  listen_host: "127.0.0.1"
   # Maximum wait time for a server, in seconds.
   startup_timeout_secs: 15
   # Delay between readiness probes, in milliseconds.

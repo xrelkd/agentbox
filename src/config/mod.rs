@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 use crate::error::{self, Result};
 
@@ -80,8 +80,18 @@ pub struct ContainerConfig {
     pub pids_limit: u32,
     /// Container memory limit passed to Podman.
     pub memory_limit: String,
+    /// Container memory-plus-swap limit passed to Podman.
+    pub memory_swap: Option<String>,
+    /// Container CPU quota passed to Podman.
+    pub cpus: Option<String>,
+    /// Additional container ulimits.
+    pub ulimits: BTreeMap<String, String>,
+    /// Size of the `/tmp` tmpfs.
+    pub tmp_size: String,
     /// Size of the `/var/tmp` tmpfs.
     pub var_tmp_size: String,
+    /// Inherit host proxy environment variables into the container.
+    pub inherit_proxy: bool,
     /// Mount the generated rootfs as an overlay (`O`).
     pub rootfs_overlay: bool,
 }
@@ -188,9 +198,6 @@ pub struct ServerConfig {
     pub serve_host: String,
     /// Address the server listens on inside the container.
     pub listen_host: String,
-    /// Publish `serve_port` on a random host loopback port, never on external
-    /// networks.
-    pub publish_port: bool,
     /// Maximum wait time for a server to become ready.
     pub startup_timeout_secs: u64,
     /// Delay between readiness probes.
@@ -253,7 +260,7 @@ impl Default for GeneralConfig {
             ai_env_mount_path: "/run/ai-env".into(),
             container_prefix: "agentbox".into(),
             runtime_base_dir: "/tmp".into(),
-            forbidden_dirs: vec!["/".into(), "/tmp".into()],
+            forbidden_dirs: vec!["/tmp".into()],
             shell: "/run/ai-env/bin/zsh".into(),
             default_agent: "shell".into(),
             ocelot_path: "/run/ai-env/bin/ocelot".into(),
@@ -272,8 +279,16 @@ impl Default for ContainerConfig {
             drop_all_caps: true,
             pids_limit: 1024,
             memory_limit: "12g".into(),
+            memory_swap: None,
+            cpus: Some("2".into()),
+            ulimits: BTreeMap::from([
+                ("core".into(), "0".into()),
+                ("nofile".into(), "4096:8192".into()),
+            ]),
+            tmp_size: "2g".into(),
             var_tmp_size: "2g".into(),
             rootfs_overlay: true,
+            inherit_proxy: false,
         }
     }
 }
@@ -286,7 +301,7 @@ impl Default for NixConfig {
             daemon_socket_dir: "/nix/var/nix/daemon-socket".into(),
             profiles_dir: "/nix/var/nix/profiles".into(),
             etc_nix_dir: "/etc/nix".into(),
-            mount_kernel_modules: true,
+            mount_kernel_modules: false,
             kernel_modules_dir: "/run/current-system/kernel-modules/lib/modules".into(),
             kernel_modules_mount_dir: "/lib/modules".into(),
             host_config_dir: "~/.config/nix".into(),
@@ -311,12 +326,16 @@ impl Default for MountsConfig {
     fn default() -> Self {
         Self {
             state_dirs: vec![
-                MountEntry::new("~/.agents", "~/.agents", false, false),
-                MountEntry::new("~/.config/opencode", "~/.config/opencode", false, false),
-                MountEntry::new("~/.local/share/opencode", "~/.local/share/opencode", false, false),
+                MountEntry::new("~/.agents", "~/.agents", true, false),
+                MountEntry::new("~/.claude", "~/.claude", true, false),
+                MountEntry::new("~/.claude/projects", "~/.claude/projects", false, false),
+                MountEntry::new("~/.claude/todos", "~/.claude/todos", false, false),
+                MountEntry::new("~/.config/opencode", "~/.config/opencode", true, false),
+                MountEntry::new("~/.local/share/opencode", "~/.local/share/opencode", true, false),
                 MountEntry::new("~/.local/state/opencode", "~/.local/state/opencode", false, false),
-                MountEntry::new("~/.claude", "~/.claude", false, false),
-                MountEntry::new("~/.gemini", "~/.gemini", false, false),
+                MountEntry::new("~/.gemini", "~/.gemini", true, false),
+                MountEntry::new("~/.gemini/history", "~/.gemini/history", false, false),
+                MountEntry::new("~/.gemini/tmp", "~/.gemini/tmp", false, false),
             ],
             optional_ro_mounts: vec![
                 MountEntry::new("~/.local/bin", "~/.local/bin", true, true),
@@ -366,8 +385,7 @@ impl Default for ServerConfig {
         Self {
             serve_port: 4096,
             serve_host: "127.0.0.1".into(),
-            listen_host: "0.0.0.0".into(),
-            publish_port: true,
+            listen_host: "127.0.0.1".into(),
             startup_timeout_secs: 15,
             poll_interval_ms: 250,
         }
@@ -472,17 +490,30 @@ impl Config {
             error::InvalidConfigSnafu { message: "container.workdir must be an absolute path" }
         );
         snafu::ensure!(
+            !self.container.memory_limit.is_empty(),
+            error::InvalidConfigSnafu { message: "container.memory_limit must not be empty" }
+        );
+        snafu::ensure!(
+            self.container.memory_swap.as_ref().is_none_or(|value| !value.is_empty()),
+            error::InvalidConfigSnafu { message: "container.memory_swap must not be empty" }
+        );
+        snafu::ensure!(
+            self.container.cpus.as_ref().is_none_or(|value| !value.is_empty()),
+            error::InvalidConfigSnafu { message: "container.cpus must not be empty" }
+        );
+        snafu::ensure!(
+            !self.container.tmp_size.is_empty() && !self.container.var_tmp_size.is_empty(),
+            error::InvalidConfigSnafu { message: "container tmpfs sizes must not be empty" }
+        );
+        snafu::ensure!(
+            self.container.ulimits.keys().all(|name| {
+                !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric())
+            }),
+            error::InvalidConfigSnafu { message: "container.ulimits keys must be alphanumeric" }
+        );
+        snafu::ensure!(
             !self.server.listen_host.is_empty(),
             error::InvalidConfigSnafu { message: "server.listen_host must not be empty" }
-        );
-        let loopback_listen =
-            matches!(self.server.listen_host.as_str(), "127.0.0.1" | "::1" | "localhost");
-        snafu::ensure!(
-            !self.server.publish_port || !loopback_listen,
-            error::InvalidConfigSnafu {
-                message: "server.listen_host must not be loopback when server.publish_port is \
-                          enabled"
-            }
         );
         snafu::ensure!(
             self.server.serve_port > 0,
@@ -508,7 +539,10 @@ impl Config {
                         message: format!("agents.{name}.serve requires command and attach")
                     }
                 );
+                validate_command(&serve.command)?;
+                validate_command(&serve.attach)?;
             }
+            validate_command(&agent.command)?;
         }
         Ok(())
     }
@@ -528,17 +562,21 @@ pub fn expand_path(input: &Path, home: &Path) -> PathBuf {
     PathBuf::from(expand_str(&input.to_string_lossy(), home))
 }
 
-/// Splits a configured command string into program and arguments.
 #[inline]
-pub fn split_command(command: &str) -> Vec<String> {
-    command.split_whitespace().map(str::to_owned).collect()
+fn validate_command(command: &str) -> Result<()> { split_command(command).map(|_| ()) }
+
+/// Splits a configured command string into shell-quoted words.
+pub fn split_command(command: &str) -> Result<Vec<String>> {
+    shlex::split(command).with_context(|| error::InvalidConfigSnafu {
+        message: format!("could not parse command `{command}`"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{Config, DEFAULT_CONFIG_TEMPLATE, expand_path};
+    use super::{Config, DEFAULT_CONFIG_TEMPLATE, expand_path, split_command};
 
     #[test]
     fn default_template_parses_to_default_config() {
@@ -581,8 +619,7 @@ general:
         .expect("new keys should parse");
         assert_eq!(config.server.serve_port, 6000);
         assert_eq!(config.server.serve_host, "0.0.0.0");
-        assert_eq!(config.server.listen_host, "0.0.0.0");
-        assert!(config.server.publish_port);
+        assert_eq!(config.server.listen_host, "127.0.0.1");
         assert_eq!(config.general.default_agent, "gemini");
     }
 
@@ -629,16 +666,12 @@ general:
     }
 
     #[test]
-    fn validate_rejects_loopback_listen_host_when_publishing() {
+    fn validate_allows_loopback_listen_host() {
         let mut config = Config::default();
         config.server.listen_host = "127.0.0.1".into();
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
 
         config.server.listen_host = "::1".into();
-        assert!(config.validate().is_err());
-
-        config.server.publish_port = false;
-        config.server.listen_host = "127.0.0.1".into();
         assert!(config.validate().is_ok());
     }
 
@@ -646,6 +679,30 @@ general:
     fn validate_rejects_unknown_default_agent() {
         let mut config = Config::default();
         config.general.default_agent = "missing".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn split_command_honors_shell_quoting() {
+        let words =
+            split_command(r#"claude --resume "--model claude's-choice" --append 'two words'"#)
+                .expect("command should parse");
+        assert_eq!(
+            words,
+            ["claude", "--resume", "--model claude's-choice", "--append", "two words"]
+        );
+    }
+
+    #[test]
+    fn split_command_rejects_unbalanced_quotes() {
+        assert!(split_command("claude --resume \"unclosed").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unbalanced_quotes_in_agent_command() {
+        let mut config = Config::default();
+        config.agents.get_mut("claude").expect("claude agent").command =
+            "claude --resume \"unclosed".into();
         assert!(config.validate().is_err());
     }
 }

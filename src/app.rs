@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    fmt::Write,
+    fs::{self, Permissions},
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -12,9 +14,7 @@ use crate::{
     config::{self, AgentServe, Config},
     error::{self, Result},
     ocelot,
-    podman::{
-        ContainerSpec, ContainerStatus, Mount, PodmanClient, Publish, TcpProbe, Tmpfs, shell_quote,
-    },
+    podman::{ContainerSpec, ContainerStatus, Mount, PodmanClient, TcpProbe, Tmpfs, shell_quote},
     rootfs,
     workspace::ProjectIdentity,
 };
@@ -166,7 +166,7 @@ impl App {
         drop(self.require_running_container()?);
         let name = &self.identity.container_name;
         let workdir = self.expand_config_path(&self.config.container.workdir);
-        let arguments = config::split_command(&agent.command);
+        let arguments = config::split_command(&agent.command)?;
         let command = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         self.podman.exec_interactive(name, &command, Some(&workdir))
     }
@@ -257,7 +257,7 @@ impl App {
     }
 
     fn build_attach_command(&self, agent_name: &str, serve: &AgentServe) -> Result<Vec<String>> {
-        let mut command = config::split_command(&serve.attach);
+        let mut command = config::split_command(&serve.attach)?;
         snafu::ensure!(
             !command.is_empty(),
             error::InvalidConfigSnafu {
@@ -300,7 +300,7 @@ impl App {
             })
             .collect::<String>();
         let marker = format!("{SERVE_MARKER_PREFIX}{safe_name}.started");
-        let mut arguments = config::split_command(&serve.command);
+        let mut arguments = config::split_command(&serve.command)?;
         arguments.push("--port".into());
         arguments.push(self.config.server.serve_port.to_string());
         arguments.push("--hostname".into());
@@ -342,7 +342,17 @@ impl App {
             .no_new_privileges(config.container.no_new_privileges)
             .drop_all_caps(config.container.drop_all_caps)
             .pids_limit(config.container.pids_limit)
-            .memory_limit(config.container.memory_limit.clone());
+            .memory_limit(config.container.memory_limit.clone())
+            .inherit_proxy(config.container.inherit_proxy);
+        if let Some(limit) = &config.container.memory_swap {
+            builder = builder.memory_swap(limit);
+        }
+        if let Some(cpus) = &config.container.cpus {
+            builder = builder.cpus(cpus);
+        }
+        for (name, value) in &config.container.ulimits {
+            builder = builder.ulimit(name, value);
+        }
 
         for mount in self.build_mounts(ai_env_path) {
             builder = builder.mount(mount);
@@ -350,12 +360,10 @@ impl App {
         for tmpfs in self.build_tmpfs() {
             builder = builder.tmpfs(tmpfs);
         }
-        if config.server.publish_port {
-            builder = builder.publish(Publish::new(config.server.serve_port));
-        }
         for (key, value) in self.build_env(&self.shell) {
             builder = builder.env(key, value);
         }
+        builder = builder.env_file(self.write_secret_env_file()?);
         builder.build()
     }
 
@@ -363,10 +371,14 @@ impl App {
         let config = &self.config;
         let mut mounts = Vec::new();
         let mut add = |host: PathBuf, container: PathBuf, read_only: bool| {
-            mounts.push(Mount::new(host, container, read_only));
+            let mount = if read_only {
+                Mount::new(host, container, true)
+            } else {
+                Mount::with_options(host, container, false, "nosuid,nodev")
+            };
+            mounts.push(mount);
         };
 
-        add(self.identity.tmp_dir.clone(), PathBuf::from("/tmp"), false);
         add(self.identity.home_dir.clone(), self.home.clone(), false);
 
         let store = self.expand_config_path(&config.nix.store_path);
@@ -406,11 +418,12 @@ impl App {
         }
 
         for entry in &config.mounts.state_dirs {
-            add(
-                self.expand_config_path(&entry.host),
-                self.expand_config_path(&entry.container),
-                entry.read_only,
-            );
+            let host = self.expand_config_path(&entry.host);
+            if entry.skip_if_missing && !host.exists() {
+                tracing::debug!("Skipping missing state directory {}", host.display());
+                continue;
+            }
+            add(host, self.expand_config_path(&entry.container), entry.read_only);
         }
         for entry in &config.mounts.optional_ro_mounts {
             let host = self.expand_config_path(&entry.host);
@@ -433,16 +446,23 @@ impl App {
             false,
         );
         let config_dir = self.expand_config_path(&config.nix.host_config_dir);
-        add(config_dir.clone(), config_dir, true);
+        let relative_config_dir = config_dir.strip_prefix(&self.home).unwrap_or(&config_dir);
+        add(self.identity.home_dir.join(relative_config_dir), config_dir, true);
 
         mounts
     }
 
     fn build_tmpfs(&self) -> Vec<Tmpfs> {
-        vec![Tmpfs::new(
-            PathBuf::from("/var/tmp"),
-            format!("rw,nosuid,size={}", self.config.container.var_tmp_size),
-        )]
+        vec![
+            Tmpfs::new(
+                PathBuf::from("/tmp"),
+                format!("rw,nosuid,nodev,size={}", self.config.container.tmp_size),
+            ),
+            Tmpfs::new(
+                PathBuf::from("/var/tmp"),
+                format!("rw,nosuid,nodev,noexec,size={}", self.config.container.var_tmp_size),
+            ),
+        ]
     }
 
     fn build_env(&self, shell: &str) -> Vec<(String, String)> {
@@ -496,21 +516,38 @@ impl App {
             variables.push((key.clone(), self.expand_config_value(value)));
         }
 
-        let secrets_base = self.expand_config_path(&config.secrets.base_dir);
-        for (key, relative) in &config.secrets.entries {
-            let path = secrets_base.join(relative);
-            match fs::read_to_string(&path) {
-                Ok(value) => {
-                    let value = value.trim_end_matches(['\n', '\r']);
-                    variables.push((key.clone(), value.to_owned()));
-                }
-                Err(error) => {
-                    tracing::debug!("Skipping unreadable secret {}: {error}", path.display());
-                }
-            }
-        }
-
         variables
+    }
+
+    fn write_secret_env_file(&self) -> Result<PathBuf> {
+        let path = self.identity.tmp_dir.join("secrets.env");
+        let secrets_base = self.expand_config_path(&self.config.secrets.base_dir);
+        let mut content = String::new();
+        for (key, relative) in &self.config.secrets.entries {
+            snafu::ensure!(
+                !key.is_empty()
+                    && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                error::InvalidConfigSnafu {
+                    message: format!("secrets.entries key `{key}` is not a valid env name")
+                }
+            );
+            let secret_path = secrets_base.join(relative);
+            let Ok(value) = fs::read_to_string(&secret_path) else {
+                tracing::debug!("Skipping unreadable secret {}", secret_path.display());
+                continue;
+            };
+            let value = value.trim_end_matches(['\n', '\r']);
+            if value.contains(['\n', '\r']) {
+                tracing::warn!("Skipping multi-line secret {key}");
+                continue;
+            }
+            let _ = writeln!(content, "{key}={value}");
+        }
+        fs::write(&path, content).with_context(|_| error::WriteFileSnafu { path: path.clone() })?;
+        fs::set_permissions(&path, Permissions::from_mode(0o600))
+            .with_context(|_| error::SetPermissionsSnafu { path: path.clone() })?;
+        Ok(path)
     }
 
     #[inline]
@@ -629,10 +666,53 @@ mod tests {
     }
 
     #[test]
-    fn only_var_tmp_uses_tmpfs() {
+    fn temporary_directories_are_sized_tmpfs_mounts() {
         let tmpfs = app().build_tmpfs();
-        assert_eq!(tmpfs.len(), 1);
-        assert_eq!(tmpfs[0].target, PathBuf::from("/var/tmp"));
+        assert_eq!(tmpfs.len(), 2);
+        assert_eq!(tmpfs[0].target, PathBuf::from("/tmp"));
+        assert!(tmpfs[0].options.contains("nodev"));
+        assert_eq!(tmpfs[1].target, PathBuf::from("/var/tmp"));
+        assert!(tmpfs[1].options.contains("noexec"));
+    }
+
+    #[test]
+    fn configuration_directories_are_mounted_read_only() {
+        let app = app();
+        let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
+        let config = mounts
+            .iter()
+            .find(|mount| mount.container == Path::new("/home/tester/.claude"))
+            .expect("claude config mount");
+        assert!(config.read_only);
+
+        let nix = mounts
+            .iter()
+            .find(|mount| mount.container == Path::new("/home/tester/.config/nix"))
+            .expect("nix config mount");
+        assert!(nix.read_only);
+        assert!(nix.host.starts_with(&app.identity.home_dir));
+    }
+
+    #[test]
+    fn secret_env_file_is_private_and_omits_values_from_args() {
+        let root = env::temp_dir().join(format!("agentbox-env-file-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&root));
+        fs::create_dir_all(root.join("secrets")).expect("create secrets dir");
+        fs::write(root.join("secrets/token"), "s3cr3t\n").expect("write secret");
+
+        let mut app = app();
+        app.config.secrets.base_dir = root.join("secrets").to_string_lossy().into_owned();
+        app.config.secrets.entries.clear();
+        drop(app.config.secrets.entries.insert("TEST_TOKEN".into(), "token".into()));
+        app.identity.tmp_dir = root.join("tmp");
+        fs::create_dir_all(&app.identity.tmp_dir).expect("create tmp dir");
+
+        let path = app.write_secret_env_file().expect("write env file");
+        let content = fs::read_to_string(&path).expect("read env file");
+        assert_eq!(content, "TEST_TOKEN=s3cr3t\n");
+        assert_eq!(fs::metadata(&path).expect("metadata").permissions().mode() & 0o777, 0o600);
+
+        drop(fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -747,6 +827,6 @@ mod tests {
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("--port")));
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("4096")));
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("--hostname")));
-        assert!(arguments.iter().any(|argument| argument.as_str() == Some("0.0.0.0")));
+        assert!(arguments.iter().any(|argument| argument.as_str() == Some("127.0.0.1")));
     }
 }

@@ -57,6 +57,9 @@ pub enum Error {
     #[snafu(display("Could not remove file `{}`: {source}", path.display()))]
     RemoveFile { path: PathBuf, source: std::io::Error },
 
+    #[snafu(display("Could not rename `{}` to `{}`: {source}", from.display(), to.display()))]
+    RenameFile { from: PathBuf, to: PathBuf, source: std::io::Error },
+
     #[snafu(display("Could not remove directory `{}`: {source}", path.display()))]
     RemoveDir { path: PathBuf, source: std::io::Error },
 

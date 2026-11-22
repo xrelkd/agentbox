@@ -21,22 +21,34 @@ pub struct Mount {
     pub container: PathBuf,
     /// Whether the mount is read-only.
     pub read_only: bool,
+    /// Extra Podman mount options.
+    pub options: String,
 }
 
 impl Mount {
     /// Creates a bind mount.
     pub const fn new(host: PathBuf, container: PathBuf, read_only: bool) -> Self {
-        Self { host, container, read_only }
+        Self { host, container, read_only, options: String::new() }
+    }
+
+    /// Creates a bind mount with extra Podman options.
+    pub fn with_options(
+        host: PathBuf,
+        container: PathBuf,
+        read_only: bool,
+        options: impl Into<String>,
+    ) -> Self {
+        Self { host, container, read_only, options: options.into() }
     }
 
     fn to_arg(&self) -> OsString {
-        format!(
-            "{}:{}:{}",
-            self.host.display(),
-            self.container.display(),
-            if self.read_only { "ro" } else { "rw" }
-        )
-        .into()
+        let mode = if self.read_only { "ro" } else { "rw" };
+        let options = if self.options.is_empty() {
+            mode.to_owned()
+        } else {
+            format!("{mode},{}", self.options)
+        };
+        format!("{}:{}:{}", self.host.display(), self.container.display(), options).into()
     }
 }
 
@@ -56,20 +68,6 @@ impl Tmpfs {
     }
 
     fn to_arg(&self) -> OsString { format!("{}:{}", self.target.display(), self.options).into() }
-}
-
-/// Host loopback publication of a container port using an ephemeral host port.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Publish {
-    /// Port inside the container.
-    pub container_port: u16,
-}
-
-impl Publish {
-    /// Publishes `container_port` on a randomly assigned host loopback port.
-    pub const fn new(container_port: u16) -> Self { Self { container_port } }
-
-    fn to_arg(self) -> OsString { format!("127.0.0.1::{}", self.container_port).into() }
 }
 
 /// Parsed container state from `podman inspect`.
@@ -154,10 +152,14 @@ pub struct ContainerSpec {
     drop_all_caps: bool,
     pids_limit: Option<u32>,
     memory_limit: Option<String>,
+    memory_swap: Option<String>,
+    cpus: Option<String>,
+    ulimits: Vec<(String, String)>,
+    inherit_proxy: bool,
     mounts: Vec<Mount>,
     tmpfs: Vec<Tmpfs>,
     env: Vec<(String, String)>,
-    publishes: Vec<Publish>,
+    env_file: Option<PathBuf>,
 }
 
 /// Builds a [`ContainerSpec`] without exposing raw Podman arguments.
@@ -179,10 +181,14 @@ pub struct ContainerSpecBuilder {
     drop_all_caps: bool,
     pids_limit: Option<u32>,
     memory_limit: Option<String>,
+    memory_swap: Option<String>,
+    cpus: Option<String>,
+    ulimits: Vec<(String, String)>,
+    inherit_proxy: bool,
     mounts: Vec<Mount>,
     tmpfs: Vec<Tmpfs>,
     env: Vec<(String, String)>,
-    publishes: Vec<Publish>,
+    env_file: Option<PathBuf>,
 }
 
 /// Readiness probe executed inside the container.
@@ -246,7 +252,6 @@ impl PodmanClient {
     /// Starts a detached container from a validated specification.
     pub fn run_detached(&self, spec: &ContainerSpec) -> Result<()> {
         let args = spec.build_args();
-        tracing::debug!("Starting container with: {}", ContainerSpec::redacted_args(&args));
         drop(self.run(&args, false)?);
         Ok(())
     }
@@ -393,7 +398,7 @@ impl PodmanClient {
     }
 
     fn run(&self, args: &[OsString], allow_failure: bool) -> Result<Output> {
-        tracing::debug!("Running podman {}", os_args_to_string(args));
+        tracing::debug!("Running podman {}", redact_args(args));
         let output = Command::new(&self.binary)
             .args(args)
             .output()
@@ -443,6 +448,16 @@ impl ContainerSpec {
         if let Some(limit) = &self.memory_limit {
             args.push(OsString::from(format!("--memory={limit}")));
         }
+        if let Some(limit) = &self.memory_swap {
+            args.push(OsString::from(format!("--memory-swap={limit}")));
+        }
+        if let Some(cpus) = &self.cpus {
+            args.push(OsString::from(format!("--cpus={cpus}")));
+        }
+        for (name, value) in &self.ulimits {
+            args.push(OsString::from(format!("--ulimit={name}={value}")));
+        }
+        args.push(OsString::from(format!("--http-proxy={}", self.inherit_proxy)));
         for mount in &self.mounts {
             args.push(OsString::from("-v"));
             args.push(mount.to_arg());
@@ -455,11 +470,10 @@ impl ContainerSpec {
             args.push(OsString::from("-e"));
             args.push(OsString::from(format!("{key}={value}")));
         }
-        for publish in &self.publishes {
-            args.push(OsString::from("-p"));
-            args.push(publish.to_arg());
+        if let Some(path) = &self.env_file {
+            args.push(OsString::from("--env-file"));
+            args.push(path.as_os_str().to_os_string());
         }
-
         let rootfs = if self.rootfs_overlay {
             format!("{}:O", self.rootfs.display())
         } else {
@@ -472,25 +486,26 @@ impl ContainerSpec {
         args.push(OsString::from(&self.init_script));
         args
     }
+}
 
-    fn redacted_args(args: &[OsString]) -> String {
-        let mut redact = false;
-        args.iter()
-            .map(|argument| {
-                let text = argument.to_string_lossy();
-                if redact {
-                    redact = false;
-                    return "<redacted>".to_owned();
-                }
-                let owned = text.into_owned();
-                if owned == "-e" {
-                    redact = true;
-                }
-                owned
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
+#[inline]
+fn redact_args(args: &[OsString]) -> String {
+    let mut redact = false;
+    args.iter()
+        .map(|argument| {
+            let text = argument.to_string_lossy();
+            if redact {
+                redact = false;
+                return "<redacted>".to_owned();
+            }
+            let owned = text.into_owned();
+            if owned == "-e" {
+                redact = true;
+            }
+            owned
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl ContainerSpecBuilder {
@@ -512,10 +527,14 @@ impl ContainerSpecBuilder {
             drop_all_caps: false,
             pids_limit: None,
             memory_limit: None,
+            memory_swap: None,
+            cpus: None,
+            ulimits: Vec::new(),
+            inherit_proxy: false,
             mounts: Vec::new(),
             tmpfs: Vec::new(),
             env: Vec::new(),
-            publishes: Vec::new(),
+            env_file: None,
         }
     }
 
@@ -598,6 +617,36 @@ impl ContainerSpecBuilder {
         self
     }
 
+    /// Sets the container memory-plus-swap limit.
+    pub fn memory_swap(mut self, limit: impl Into<String>) -> Self {
+        self.memory_swap = Some(limit.into());
+        self
+    }
+
+    /// Sets the container CPU quota.
+    pub fn cpus(mut self, cpus: impl Into<String>) -> Self {
+        self.cpus = Some(cpus.into());
+        self
+    }
+
+    /// Adds a container ulimit.
+    pub fn ulimit(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.ulimits.push((name.into(), value.into()));
+        self
+    }
+
+    /// Controls whether host proxy environment variables are inherited.
+    pub const fn inherit_proxy(mut self, enabled: bool) -> Self {
+        self.inherit_proxy = enabled;
+        self
+    }
+
+    /// Sets a host env file read by Podman instead of passing values as args.
+    pub fn env_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.env_file = Some(path.into());
+        self
+    }
+
     /// Adds a bind mount, replacing any previous mount with the same container
     /// path.
     pub fn mount(mut self, mount: Mount) -> Self {
@@ -615,12 +664,6 @@ impl ContainerSpecBuilder {
     /// Adds an environment variable.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
-        self
-    }
-
-    /// Publishes a container port on an ephemeral host loopback port.
-    pub fn publish(mut self, publish: Publish) -> Self {
-        self.publishes.push(publish);
         self
     }
 
@@ -648,10 +691,14 @@ impl ContainerSpecBuilder {
             drop_all_caps: self.drop_all_caps,
             pids_limit: self.pids_limit,
             memory_limit: self.memory_limit,
+            memory_swap: self.memory_swap,
+            cpus: self.cpus,
+            ulimits: self.ulimits,
+            inherit_proxy: self.inherit_proxy,
             mounts: self.mounts,
             tmpfs: self.tmpfs,
             env: self.env,
-            publishes: self.publishes,
+            env_file: self.env_file,
         })
     }
 }
@@ -682,7 +729,7 @@ mod tests {
     use std::{env, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
     use super::{
-        ContainerSpec, ContainerStatus, ExecFlags, Mount, PodmanClient, Publish, TcpProbe,
+        ContainerSpec, ContainerStatus, ExecFlags, Mount, PodmanClient, TcpProbe, redact_args,
         shell_quote,
     };
     use crate::error::Error;
@@ -700,9 +747,17 @@ mod tests {
             .drop_all_caps(true)
             .pids_limit(1024)
             .memory_limit("12g")
-            .mount(Mount::new(PathBuf::from("/tmp/host"), PathBuf::from("/tmp"), false))
+            .memory_swap("24g")
+            .cpus("2")
+            .ulimit("core", "0")
+            .ulimit("nofile", "4096:8192")
+            .mount(Mount::with_options(
+                PathBuf::from("/tmp/host"),
+                PathBuf::from("/tmp"),
+                false,
+                "nosuid,nodev",
+            ))
             .env("OPENROUTER_API_KEY", "super-secret")
-            .publish(Publish::new(4096))
             .build()
             .expect("spec should build")
     }
@@ -718,9 +773,13 @@ mod tests {
         assert!(strings.contains(&"--cap-drop=ALL".into()));
         assert!(strings.contains(&"--pids-limit=1024".into()));
         assert!(strings.contains(&"--memory=12g".into()));
-        assert!(strings.contains(&"/tmp/host:/tmp:rw".into()));
-        assert!(strings.contains(&"-p".into()));
-        assert!(strings.contains(&"127.0.0.1::4096".into()));
+        assert!(strings.contains(&"--memory-swap=24g".into()));
+        assert!(strings.contains(&"--cpus=2".into()));
+        assert!(strings.contains(&"--ulimit=core=0".into()));
+        assert!(strings.contains(&"--ulimit=nofile=4096:8192".into()));
+        assert!(strings.contains(&"--http-proxy=false".into()));
+        assert!(strings.contains(&"/tmp/host:/tmp:rw,nosuid,nodev".into()));
+        assert!(!strings.contains(&"-p".into()));
         assert!(strings.contains(&"--rootfs".into()));
         assert!(strings.contains(&"/tmp/rootfs:O".into()));
         assert!(strings.contains(&"OPENROUTER_API_KEY=super-secret".into()));
@@ -761,9 +820,30 @@ mod tests {
     fn redacted_args_hide_environment_values() {
         let spec = minimal_spec();
         let args = spec.build_args();
-        let redacted = ContainerSpec::redacted_args(&args);
+        let redacted = redact_args(&args);
         assert!(redacted.contains("<redacted>"));
         assert!(!redacted.contains("super-secret"));
+    }
+
+    #[test]
+    fn env_file_and_proxy_flags_are_emitted() {
+        let spec = ContainerSpec::builder("agentbox-env")
+            .hostname("sandbox-env")
+            .workdir(PathBuf::from("/workspace"))
+            .user(1000, 1000)
+            .rootfs(PathBuf::from("/tmp/rootfs"))
+            .init_shell("/bin/sh")
+            .init_script("exec sleep infinity")
+            .env_file(PathBuf::from("/tmp/secrets.env"))
+            .inherit_proxy(true)
+            .build()
+            .expect("spec should build");
+        let args = spec.build_args();
+        let strings = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+
+        assert!(strings.contains(&"--env-file".into()));
+        assert!(strings.contains(&"/tmp/secrets.env".into()));
+        assert!(strings.contains(&"--http-proxy=true".into()));
     }
 
     #[test]
@@ -786,15 +866,6 @@ mod tests {
             interval: std::time::Duration::from_millis(250),
         };
         assert_eq!(probe.script(), "exec 3<>/dev/tcp/'127.0.0.1'/4096");
-    }
-
-    #[test]
-    fn published_port_is_bound_to_host_loopback_only() {
-        let publish = Publish::new(4096);
-        let arg = publish.to_arg().to_string_lossy().into_owned();
-        assert_eq!(arg, "127.0.0.1::4096");
-        assert!(!arg.contains("0.0.0.0"));
-        assert!(!arg.contains("[::]"));
     }
 
     #[test]
