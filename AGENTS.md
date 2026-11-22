@@ -45,12 +45,13 @@ cargo nextest run
 | -------------------- | ------------- | ---------------------------------------------------- |
 | `src/main.rs`        | Binary module | Entrypoint, logging, config/completion fast paths    |
 | `src/cli.rs`         | Module        | Clap command definitions                             |
-| `src/config.rs`      | Module        | YAML schema, defaults, expansion, validation         |
+| `src/config/mod.rs`  | Module        | YAML schema, defaults, expansion, validation         |
 | `src/error.rs`       | Module        | SNAFU error and result types                         |
+| `src/ocelot.rs`      | Module        | ocelot supervise config serialization                |
 | `src/workspace.rs`   | Module        | Canonical project identity and path hashing          |
 | `src/rootfs.rs`      | Module        | Minimal rootfs skeleton and symlinks                 |
 | `src/podman.rs`      | Module        | Container command construction and lifecycle         |
-| `src/app.rs`         | Module        | Mount/env planning and tmux session orchestration    |
+| `src/app.rs`         | Module        | Mount/env planning and session orchestration         |
 | `devshell/`          | Nix           | Packages, dev shell, container, nfpm/tarball helpers |
 | `.github/workflows/` | CI            | Rust, lints, Nix, release, and container checks      |
 
