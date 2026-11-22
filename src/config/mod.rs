@@ -30,7 +30,7 @@ pub struct Config {
     pub secrets: SecretsConfig,
     /// Generic server startup and readiness polling settings.
     pub server: ServerConfig,
-    /// Agent commands and their default session names.
+    /// Agent commands for interactive sessions.
     pub agents: BTreeMap<String, AgentConfig>,
 }
 
@@ -52,23 +52,10 @@ pub struct GeneralConfig {
     pub shell: String,
     /// Agent used when no command is given; `shell` opens an interactive shell.
     pub default_agent: String,
-    /// Interactive session backend used by shell and TUI agents.
-    pub session_backend: SessionBackend,
     /// Container path to the `ocelot` supervisor binary.
     pub ocelot_path: String,
     /// Podman executable used for all container operations.
     pub podman_binary: String,
-}
-
-/// Interactive session backend for shell and TUI agents.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionBackend {
-    /// Run the shell or agent directly in an interactive `podman exec`.
-    #[default]
-    Direct,
-    /// Keep sessions in a tmux server inside the container.
-    Tmux,
 }
 
 /// Container isolation, resources, and rootfs settings.
@@ -193,8 +180,6 @@ pub struct SecretsConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    /// tmux session created when the container starts.
-    pub default_tmux_session: String,
     /// Port used by an agent `serve` command.
     #[serde(alias = "opencode_port")]
     pub serve_port: u16,
@@ -224,15 +209,13 @@ pub struct AgentServe {
     pub attach: String,
 }
 
-/// Agent command and default session name.
+/// Agent command and optional server definition.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct AgentConfig {
     /// Command executed for an interactive agent session.
     pub command: String,
-    /// Session name used when no explicit session is provided.
-    pub default_session: String,
     /// Optional client/server commands for the agent.
     pub serve: Option<AgentServe>,
 }
@@ -248,17 +231,16 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             server: ServerConfig::default(),
             agents: BTreeMap::from([
-                ("claude".into(), AgentConfig::new("claude", "claude")),
-                ("gemini".into(), AgentConfig::new("gemini", "gemini")),
+                ("claude".into(), AgentConfig::new("claude --resume")),
+                ("gemini".into(), AgentConfig::new("gemini --resume")),
                 (
                     "opencode".into(),
                     AgentConfig::with_serve(
                         "opencode",
-                        "opencode",
                         AgentServe::new("opencode serve", "opencode attach"),
                     ),
                 ),
-                ("oc-tui".into(), AgentConfig::new("opencode", "opencode")),
+                ("oc-tui".into(), AgentConfig::new("opencode")),
             ]),
         }
     }
@@ -274,7 +256,6 @@ impl Default for GeneralConfig {
             forbidden_dirs: vec!["/".into(), "/tmp".into()],
             shell: "/run/ai-env/bin/zsh".into(),
             default_agent: "shell".into(),
-            session_backend: SessionBackend::Direct,
             ocelot_path: "/run/ai-env/bin/ocelot".into(),
             podman_binary: "podman".into(),
         }
@@ -383,7 +364,6 @@ impl Default for SecretsConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            default_tmux_session: "main".into(),
             serve_port: 4096,
             serve_host: "127.0.0.1".into(),
             listen_host: "0.0.0.0".into(),
@@ -403,21 +383,11 @@ impl AgentServe {
 
 impl AgentConfig {
     /// Creates an interactive-only agent definition.
-    pub fn new(command: impl Into<String>, default_session: impl Into<String>) -> Self {
-        Self { command: command.into(), default_session: default_session.into(), serve: None }
-    }
+    pub fn new(command: impl Into<String>) -> Self { Self { command: command.into(), serve: None } }
 
     /// Creates an agent definition with client/server commands.
-    pub fn with_serve(
-        command: impl Into<String>,
-        default_session: impl Into<String>,
-        serve: AgentServe,
-    ) -> Self {
-        Self {
-            command: command.into(),
-            default_session: default_session.into(),
-            serve: Some(serve),
-        }
+    pub fn with_serve(command: impl Into<String>, serve: AgentServe) -> Self {
+        Self { command: command.into(), serve: Some(serve) }
     }
 }
 
@@ -568,7 +538,7 @@ pub fn split_command(command: &str) -> Vec<String> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{Config, DEFAULT_CONFIG_TEMPLATE, SessionBackend, expand_path};
+    use super::{Config, DEFAULT_CONFIG_TEMPLATE, expand_path};
 
     #[test]
     fn default_template_parses_to_default_config() {
@@ -591,7 +561,6 @@ general:
         assert_eq!(config.general.ai_env_path, Config::default().general.ai_env_path);
         assert_eq!(config.agents.len(), 4);
         assert_eq!(config.general.default_agent, "shell");
-        assert_eq!(config.general.session_backend, SessionBackend::Direct);
         assert_eq!(
             config.agents["opencode"].serve.as_ref().expect("opencode serve").command,
             "opencode serve"
@@ -607,7 +576,6 @@ server:
   serve_host: 0.0.0.0
 general:
   default_agent: gemini
-  session_backend: tmux
 ",
         )
         .expect("new keys should parse");
@@ -616,7 +584,15 @@ general:
         assert_eq!(config.server.listen_host, "0.0.0.0");
         assert!(config.server.publish_port);
         assert_eq!(config.general.default_agent, "gemini");
-        assert_eq!(config.general.session_backend, SessionBackend::Tmux);
+    }
+
+    #[test]
+    fn agent_defaults_resume_native_sessions() {
+        let agents = &Config::default().agents;
+        assert_eq!(agents["claude"].command, "claude --resume");
+        assert_eq!(agents["gemini"].command, "gemini --resume");
+        assert!(agents["claude"].serve.is_none());
+        assert!(agents["gemini"].serve.is_none());
     }
 
     #[test]

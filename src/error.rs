@@ -78,9 +78,6 @@ pub enum Error {
     #[snafu(display("Agent `{name}` has no server command configured"))]
     AgentHasNoServe { name: String },
 
-    #[snafu(display("`sessions` requires session_backend: tmux"))]
-    SessionsUnavailable,
-
     #[snafu(display(
         "Container `{name}` is not running (status: {status}); run `agentbox start` first"
     ))]

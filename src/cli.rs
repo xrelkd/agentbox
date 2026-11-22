@@ -44,9 +44,6 @@ pub enum Command {
         /// Agent name to attach to; defaults to `general.default_agent`.
         #[arg(long, value_name = "NAME")]
         agent: Option<String>,
-
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
     },
 
     /// Stop the project container and clean temporary directories.
@@ -61,19 +58,12 @@ pub enum Command {
     List,
 
     /// Attach to a shell session in the running container.
-    #[command(alias = "tmux")]
-    Shell {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
+    Shell,
 
-    /// Attach to a session for any configured agent in the running container.
+    /// Attach to a configured agent in the running container.
     Agent {
         /// Configured agent name.
         name: String,
-
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
     },
 
     /// Attach to the `OpenCode` server in the running container (alias: `oc`).
@@ -81,25 +71,13 @@ pub enum Command {
     Opencode,
 
     /// Attach to an `OpenCode` TUI session in the running container.
-    OcTui {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
+    OcTui,
 
     /// Attach to a Claude session in the running container.
-    Claude {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
+    Claude,
 
     /// Attach to a Gemini session in the running container.
-    Gemini {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
-
-    /// List tmux sessions inside the running project container.
-    Sessions,
+    Gemini,
 
     /// Print the host temporary directory for this project.
     Tmp,
@@ -138,7 +116,7 @@ pub enum ConfigAction {
 impl Cli {
     /// Returns the selected command, defaulting to a detached container start.
     pub fn command_or_default(&self) -> Command {
-        self.command.clone().unwrap_or(Command::Start { attach: false, agent: None, session: None })
+        self.command.clone().unwrap_or(Command::Start { attach: false, agent: None })
     }
 
     /// Executes the selected command.
@@ -171,16 +149,13 @@ impl Cli {
         let app = App::new(config, identity, home);
 
         match command {
-            Command::Start { attach, agent, session } => {
-                app.start(agent.as_deref(), session, attach)
-            }
-            Command::Agent { name, session } => app.launch_agent(&name, session),
-            Command::Opencode => app.launch_agent("opencode", None),
-            Command::OcTui { session } => app.launch_agent("oc-tui", session),
-            Command::Claude { session } => app.launch_agent("claude", session),
-            Command::Gemini { session } => app.launch_agent("gemini", session),
-            Command::Shell { session } => app.attach_shell(session),
-            Command::Sessions => app.list_sessions(),
+            Command::Start { attach, agent } => app.start(agent.as_deref(), attach),
+            Command::Agent { name } => app.launch_agent(&name),
+            Command::Opencode => app.launch_agent("opencode"),
+            Command::OcTui => app.launch_agent("oc-tui"),
+            Command::Claude => app.launch_agent("claude"),
+            Command::Gemini => app.launch_agent("gemini"),
+            Command::Shell => app.attach_shell(),
             Command::Tmp => {
                 app.print_temporary_dir();
                 Ok(())
@@ -207,10 +182,7 @@ mod tests {
     #[test]
     fn defaults_to_detached_start() {
         let cli = Cli::try_parse_from(["agentbox"]).expect("parse empty args");
-        assert!(matches!(
-            cli.command_or_default(),
-            Command::Start { attach: false, agent: None, session: None }
-        ));
+        assert!(matches!(cli.command_or_default(), Command::Start { attach: false, agent: None }));
         assert_eq!(cli.verbose, 0);
     }
 
@@ -218,46 +190,30 @@ mod tests {
     fn default_ignores_configured_agent() {
         let cli = Cli::try_parse_from(["agentbox", "--config", "/tmp/agentbox.yaml"])
             .expect("parse config option");
-        assert!(matches!(
-            cli.command_or_default(),
-            Command::Start { attach: false, agent: None, session: None }
-        ));
+        assert!(matches!(cli.command_or_default(), Command::Start { attach: false, agent: None }));
     }
 
     #[test]
     fn parses_start_and_agent_commands() {
-        let start =
-            Cli::try_parse_from(["agentbox", "start", "--attach", "--agent", "claude", "review"])
-                .expect("parse start");
+        let start = Cli::try_parse_from(["agentbox", "start", "--attach", "--agent", "claude"])
+            .expect("parse start");
         assert!(matches!(
             start.command,
-            Some(Command::Start { attach: true, agent: Some(name), session: Some(session) })
-                if name == "claude" && session == "review"
+            Some(Command::Start { attach: true, agent: Some(name) }) if name == "claude"
         ));
 
         let detached = Cli::try_parse_from(["agentbox", "start"]).expect("parse detached start");
-        assert!(matches!(
-            detached.command,
-            Some(Command::Start { attach: false, agent: None, session: None })
-        ));
+        assert!(matches!(detached.command, Some(Command::Start { attach: false, agent: None })));
 
         let agent =
             Cli::try_parse_from(["agentbox", "agent", "gemini"]).expect("parse generic agent");
-        assert!(matches!(
-            agent.command,
-            Some(Command::Agent { name, session: None }) if name == "gemini"
-        ));
+        assert!(matches!(agent.command, Some(Command::Agent { name }) if name == "gemini"));
     }
 
     #[test]
     fn parses_subcommand_aliases() {
         let oc = Cli::try_parse_from(["agentbox", "oc"]).expect("parse oc");
         assert!(matches!(oc.command, Some(Command::Opencode)));
-
-        let shell = Cli::try_parse_from(["agentbox", "tmux", "work"]).expect("parse tmux");
-        assert!(
-            matches!(shell.command, Some(Command::Shell { session }) if session.as_deref() == Some("work"))
-        );
 
         let list = Cli::try_parse_from(["agentbox", "ls"]).expect("parse ls");
         assert!(matches!(list.command, Some(Command::List)));

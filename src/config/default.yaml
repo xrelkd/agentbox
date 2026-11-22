@@ -25,8 +25,6 @@ general:
   shell: "/run/ai-env/bin/zsh"
   # Agent used when no command is given. `shell` opens an interactive shell.
   default_agent: "shell"
-  # Interactive session backend: `direct` uses podman exec -it, `tmux` keeps sessions.
-  session_backend: "direct"
   # Container path to the ocelot supervisor. When absent from the AI environment,
   # agentbox falls back to `podman run --init`.
   ocelot_path: "/run/ai-env/bin/ocelot"
@@ -160,8 +158,6 @@ secrets:
 # Generic server startup and readiness polling settings.
 # The old keys `opencode_port` and `opencode_host` are still accepted.
 server:
-  # tmux session used when general.session_backend is `tmux`.
-  default_tmux_session: "main"
   # Port passed to an agent `serve` command and used by its attach client.
   serve_port: 4096
   # Host used by readiness probes inside the container.
@@ -177,21 +173,17 @@ server:
   # Delay between readiness probes, in milliseconds.
   poll_interval_ms: 250
 
-# Agent commands and their default session names.
+# Agent commands. Claude and Gemini resume their native provider session.
 # Add a `serve` block to any agent that exposes a client/server mode.
 agents:
   opencode:
     command: "opencode"
-    default_session: "opencode"
     serve:
       command: "opencode serve"
       attach: "opencode attach"
   oc-tui:
     command: "opencode"
-    default_session: "opencode"
   claude:
-    command: "claude"
-    default_session: "claude"
+    command: "claude --resume"
   gemini:
-    command: "gemini"
-    default_session: "gemini"
+    command: "gemini --resume"

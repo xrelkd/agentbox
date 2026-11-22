@@ -251,16 +251,6 @@ impl PodmanClient {
         Ok(())
     }
 
-    /// Executes a command inside a container and waits for completion.
-    pub fn exec(&self, name: &str, command: &[&str], workdir: Option<&Path>) -> Result<()> {
-        let args = Self::exec_args(name, command, workdir, ExecFlags::Plain);
-        let output = self.run(&args, true)?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(command_failure("podman exec", &output))
-    }
-
     /// Starts a command inside a container without waiting for it to finish.
     pub fn exec_detached(
         &self,
@@ -272,21 +262,6 @@ impl PodmanClient {
         let output = self.run(&args, true)?;
         if output.status.success() {
             return Ok(());
-        }
-        Err(command_failure("podman exec", &output))
-    }
-
-    /// Executes a command inside a container and returns its stdout.
-    pub fn exec_capture(
-        &self,
-        name: &str,
-        command: &[&str],
-        workdir: Option<&Path>,
-    ) -> Result<String> {
-        let args = Self::exec_args(name, command, workdir, ExecFlags::Plain);
-        let output = self.run(&args, true)?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
         Err(command_failure("podman exec", &output))
     }

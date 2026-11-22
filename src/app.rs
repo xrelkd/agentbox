@@ -9,7 +9,7 @@ use std::{
 use snafu::{OptionExt, ResultExt};
 
 use crate::{
-    config::{self, AgentServe, Config, SessionBackend},
+    config::{self, AgentServe, Config},
     error::{self, Result},
     ocelot,
     podman::{
@@ -106,7 +106,7 @@ impl App {
     }
 
     /// Starts the container, optionally attaching to an agent afterwards.
-    pub fn start(&self, agent: Option<&str>, session: Option<String>, attach: bool) -> Result<()> {
+    pub fn start(&self, agent: Option<&str>, attach: bool) -> Result<()> {
         let runtime = self.start_container()?;
         if runtime.mode == InitMode::Fallback
             && let Some(name) = self.startup_serve_agent(agent)
@@ -123,20 +123,16 @@ impl App {
             return Ok(());
         }
         match agent.unwrap_or(self.config.general.default_agent.as_str()) {
-            "shell" => self.attach_shell(session),
-            name => self.launch_agent(name, session),
+            "shell" => self.attach_shell(),
+            name => self.launch_agent(name),
         }
     }
 
     /// Attaches to an agent by name, using its server when one is configured.
-    pub fn launch_agent(&self, agent_name: &str, session: Option<String>) -> Result<()> {
+    pub fn launch_agent(&self, agent_name: &str) -> Result<()> {
         let has_serve =
             self.config.agents.get(agent_name).and_then(|agent| agent.serve.as_ref()).is_some();
-        if has_serve {
-            self.attach_server(agent_name)
-        } else {
-            self.attach_agent(agent_name, session)
-        }
+        if has_serve { self.attach_server(agent_name) } else { self.attach_agent(agent_name) }
     }
 
     /// Attaches to a configured agent server from inside the container.
@@ -161,7 +157,7 @@ impl App {
     }
 
     /// Attaches to an interactive agent session in the running container.
-    pub fn attach_agent(&self, agent_name: &str, session: Option<String>) -> Result<()> {
+    pub fn attach_agent(&self, agent_name: &str) -> Result<()> {
         let agent = self
             .config
             .agents
@@ -170,88 +166,18 @@ impl App {
         drop(self.require_running_container()?);
         let name = &self.identity.container_name;
         let workdir = self.expand_config_path(&self.config.container.workdir);
-
-        match self.config.general.session_backend {
-            SessionBackend::Direct => {
-                let arguments = config::split_command(&agent.command);
-                let command = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-                self.podman.exec_interactive(name, &command, Some(&workdir))
-            }
-            SessionBackend::Tmux => {
-                let session = session.unwrap_or_else(|| agent.default_session.clone());
-                let command = agent.command.clone();
-                self.ensure_tmux_session(&session, Some(&command))?;
-                self.attach_tmux(&session)
-            }
-        }
+        let arguments = config::split_command(&agent.command);
+        let command = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        self.podman.exec_interactive(name, &command, Some(&workdir))
     }
 
     /// Attaches to a plain interactive shell.
-    pub fn attach_shell(&self, session: Option<String>) -> Result<()> {
+    pub fn attach_shell(&self) -> Result<()> {
         let runtime = self.require_running_container()?;
         let name = &self.identity.container_name;
         let workdir = self.expand_config_path(&self.config.container.workdir);
-
-        match self.config.general.session_backend {
-            SessionBackend::Direct => {
-                let arguments = [runtime.shell.as_str(), "-i"];
-                self.podman.exec_interactive(name, &arguments, Some(&workdir))
-            }
-            SessionBackend::Tmux => {
-                let session =
-                    session.unwrap_or_else(|| self.config.server.default_tmux_session.clone());
-                self.ensure_tmux_session(&session, None)?;
-                self.attach_tmux(&session)
-            }
-        }
-    }
-
-    /// Lists tmux sessions inside the project container.
-    pub fn list_sessions(&self) -> Result<()> {
-        if self.config.general.session_backend != SessionBackend::Tmux {
-            return Err(error::Error::SessionsUnavailable);
-        }
-        drop(self.require_running_container()?);
-        let output = self.podman.exec_capture(
-            &self.identity.container_name,
-            &["tmux", "list-sessions"],
-            None,
-        )?;
-        print!("{output}");
-        Ok(())
-    }
-
-    fn attach_tmux(&self, session: &str) -> Result<()> {
-        self.podman.exec_interactive(
-            &self.identity.container_name,
-            &["tmux", "attach", "-t", session],
-            None,
-        )
-    }
-
-    fn ensure_tmux_session(&self, session: &str, command: Option<&str>) -> Result<()> {
-        let name = &self.identity.container_name;
-        if self.podman.exec(name, &["tmux", "has-session", "-t", session], None).is_ok() {
-            tracing::info!("Reconnecting to existing Agent session [{session}]...");
-            return Ok(());
-        }
-
-        tracing::info!("Creating independent Agent session [{session}]...");
-        let workdir = &self.config.container.workdir;
-        self.podman.exec(
-            name,
-            &["tmux", "new-session", "-d", "-s", session, "-c", workdir],
-            None,
-        )?;
-        if let Some(command) = command {
-            tracing::info!("Starting `{command}` in session [{session}]...");
-            self.podman.exec(
-                name,
-                &["tmux", "send-keys", "-t", session, command, "Enter"],
-                None,
-            )?;
-        }
-        Ok(())
+        let arguments = [runtime.shell.as_str(), "-i"];
+        self.podman.exec_interactive(name, &arguments, Some(&workdir))
     }
 
     fn wait_for_server(&self, agent_name: &str, runtime: &Runtime) -> Result<()> {
@@ -565,7 +491,6 @@ impl App {
             "TERM",
             env::var("TERM").unwrap_or_else(|_| config.environment.default_term.clone()),
         );
-        push_env(&mut variables, "TMUX_TMPDIR", "/var/tmp".to_owned());
 
         for (key, value) in &config.environment.extra_env {
             variables.push((key.clone(), self.expand_config_value(value)));
@@ -708,12 +633,6 @@ mod tests {
         let tmpfs = app().build_tmpfs();
         assert_eq!(tmpfs.len(), 1);
         assert_eq!(tmpfs[0].target, PathBuf::from("/var/tmp"));
-    }
-
-    #[test]
-    fn tmux_sockets_are_kept_on_tmpfs() {
-        let env = app().build_env("/bin/sh");
-        assert!(env.contains(&("TMUX_TMPDIR".to_owned(), "/var/tmp".to_owned())));
     }
 
     #[test]
