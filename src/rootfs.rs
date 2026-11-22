@@ -67,25 +67,26 @@ pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) 
     )?;
 
     let shell = select_shell(config, ai_env_path, env_mount);
-    write_file(
-        &rootfs.join("etc/passwd"),
-        &format!(
-            "root:x:0:0:root:/root:/bin/sh\n{username}:x:{uid}:{gid}:{username}:{home}:{shell}\\
-             nnobody:x:65534:65534:Nobody:/:/bin/sh\n",
-            username = identity.host.username,
-            uid = identity.host.uid,
-            gid = identity.host.gid,
-            home = home.display(),
-        ),
-    )?;
-    write_file(
-        &rootfs.join("etc/group"),
-        &format!(
-            "root:x:0:\nusers:x:{gid}:{username}\nnogroup:x:65534:\n",
-            gid = identity.host.gid,
-            username = identity.host.username,
-        ),
-    )?;
+    let passwd = format!(
+        r"root:x:0:0:root:/root:/bin/sh
+{username}:x:{uid}:{gid}:{username}:{home}:{shell}
+nobody:x:65534:65534:Nobody:/:/bin/sh
+",
+        username = identity.host.username,
+        uid = identity.host.uid,
+        gid = identity.host.gid,
+        home = home.display(),
+    );
+    write_file(&rootfs.join("etc/passwd"), &passwd)?;
+    let group = format!(
+        r"root:x:0:
+users:x:{gid}:{username}
+nogroup:x:65534:
+",
+        gid = identity.host.gid,
+        username = identity.host.username,
+    );
+    write_file(&rootfs.join("etc/group"), &group)?;
 
     tracing::debug!("Prepared rootfs at {}", rootfs.display());
     Ok(shell)
@@ -104,7 +105,8 @@ pub fn container_path_to_host(
     }
 }
 
-fn select_shell(config: &Config, ai_env_path: &Path, env_mount: &str) -> String {
+/// Returns the configured container shell, with bash and `/bin/sh` fallbacks.
+pub fn select_shell(config: &Config, ai_env_path: &Path, env_mount: &str) -> String {
     let configured = &config.general.shell;
     let host_configured = container_path_to_host(configured, env_mount, ai_env_path);
     if is_executable(&host_configured) {
@@ -272,8 +274,10 @@ mod tests {
             fs::read_to_string(project.rootfs_dir.join("etc/passwd")).expect("read passwd");
         assert!(passwd.contains("tester:x:1000:1000:tester:"));
         assert!(passwd.contains("/run/ai-env/bin/zsh"));
+        assert!(passwd.lines().any(|line| line == "nobody:x:65534:65534:Nobody:/:/bin/sh"));
         let group = fs::read_to_string(project.rootfs_dir.join("etc/group")).expect("read group");
         assert!(group.contains("users:x:1000:tester"));
+        assert!(group.lines().any(|line| line == "nogroup:x:65534:"));
         assert!(root.join("home/.agents").is_dir());
         assert!(!root.join("agentbox-tmp").is_dir());
 

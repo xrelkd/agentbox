@@ -45,6 +45,9 @@ pub enum Error {
     #[snafu(display("Invalid configuration: {message}"))]
     InvalidConfig { message: String },
 
+    #[snafu(display("Could not serialize ocelot supervise config: {source}"))]
+    SerializeOcelotConfig { source: serde_yaml::Error },
+
     #[snafu(display("Could not create directory `{}`: {source}", path.display()))]
     CreateDir { path: PathBuf, source: std::io::Error },
 
@@ -72,12 +75,22 @@ pub enum Error {
     #[snafu(display("Agent `{name}` is not defined in the configuration"))]
     UnknownAgent { name: String },
 
+    #[snafu(display("Agent `{name}` has no server command configured"))]
+    AgentHasNoServe { name: String },
+
+    #[snafu(display("`sessions` requires session_backend: tmux"))]
+    SessionsUnavailable,
+
     #[snafu(display(
-        "Container `{name}` exited unexpectedly (status: {status}); logs follow:\n{logs}"
+        r"Container `{name}` exited unexpectedly (status: {status}); logs follow:
+{logs}"
     ))]
     ContainerExited { name: String, status: String, logs: String },
 
-    #[snafu(display("Timed out after {seconds}s waiting for `{name}`; logs follow:\n{logs}"))]
+    #[snafu(display(
+        r"Timed out after {seconds}s waiting for `{name}`; logs follow:
+{logs}"
+    ))]
     StartupTimeout { name: String, seconds: u64, logs: String },
 
     #[snafu(display("Could not parse Podman output `{output}`"))]

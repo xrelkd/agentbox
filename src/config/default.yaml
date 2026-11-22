@@ -23,6 +23,13 @@ general:
   forbidden_dirs: ["/", "/tmp"]
   # Preferred shell inside the container; falls back to bash if unavailable.
   shell: "/run/ai-env/bin/zsh"
+  # Agent used when no command is given. `shell` opens an interactive shell.
+  default_agent: "shell"
+  # Interactive session backend: `direct` uses podman exec -it, `tmux` keeps sessions.
+  session_backend: "direct"
+  # Container path to the ocelot supervisor. When absent from the AI environment,
+  # agentbox falls back to `podman run --init`.
+  ocelot_path: "/run/ai-env/bin/ocelot"
   # Podman executable used for all container operations.
   podman_binary: "podman"
 
@@ -146,21 +153,29 @@ secrets:
     GEMINI_API_KEY: "ai/gemini-api-key/default"
     OPENROUTER_API_KEY: "ai/openrouter-api-key/sandbox"
 
-# OpenCode server startup and readiness polling settings.
+# Generic server startup and readiness polling settings.
+# The old keys `opencode_port` and `opencode_host` are still accepted.
 server:
-  # tmux session created when the container starts.
+  # tmux session used when general.session_backend is `tmux`.
   default_tmux_session: "main"
-  # Port used by `opencode serve`.
-  opencode_port: 4096
-  # Host used by `opencode serve` and `opencode attach`.
-  opencode_host: "127.0.0.1"
-  # Maximum wait time for the OpenCode server, in seconds.
+  # Port passed to an agent `serve` command and used by its attach client.
+  serve_port: 4096
+  # Host passed to an agent `serve` command and used by its attach client.
+  serve_host: "127.0.0.1"
+  # Maximum wait time for a server, in seconds.
   startup_timeout_secs: 15
   # Delay between readiness probes, in milliseconds.
   poll_interval_ms: 250
 
-# Agent commands and their default tmux session names.
+# Agent commands and their default session names.
+# Add a `serve` block to any agent that exposes a client/server mode.
 agents:
+  opencode:
+    command: "opencode"
+    default_session: "opencode"
+    serve:
+      command: "opencode serve"
+      attach: "opencode attach"
   oc-tui:
     command: "opencode"
     default_session: "opencode"

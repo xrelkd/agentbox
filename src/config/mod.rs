@@ -28,9 +28,9 @@ pub struct Config {
     pub environment: EnvironmentConfig,
     /// SOPS secret files injected as environment variables.
     pub secrets: SecretsConfig,
-    /// `OpenCode` server startup and polling settings.
+    /// Generic server startup and readiness polling settings.
     pub server: ServerConfig,
-    /// Agent commands and their default tmux session names.
+    /// Agent commands and their default session names.
     pub agents: BTreeMap<String, AgentConfig>,
 }
 
@@ -50,8 +50,25 @@ pub struct GeneralConfig {
     pub forbidden_dirs: Vec<String>,
     /// Preferred container shell; falls back to bash when it is unavailable.
     pub shell: String,
+    /// Agent used when no command is given; `shell` opens an interactive shell.
+    pub default_agent: String,
+    /// Interactive session backend used by shell and TUI agents.
+    pub session_backend: SessionBackend,
+    /// Container path to the `ocelot` supervisor binary.
+    pub ocelot_path: String,
     /// Podman executable used for all container operations.
     pub podman_binary: String,
+}
+
+/// Interactive session backend for shell and TUI agents.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionBackend {
+    /// Run the shell or agent directly in an interactive `podman exec`.
+    #[default]
+    Direct,
+    /// Keep sessions in a tmux server inside the container.
+    Tmux,
 }
 
 /// Container isolation, resources, and rootfs settings.
@@ -172,31 +189,46 @@ pub struct SecretsConfig {
     pub entries: BTreeMap<String, String>,
 }
 
-/// `OpenCode` server startup and polling settings.
+/// Generic server startup and readiness polling settings.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
     /// tmux session created when the container starts.
     pub default_tmux_session: String,
-    /// Port used by `opencode serve`.
-    pub opencode_port: u16,
-    /// Host used by `opencode serve` and `opencode attach`.
-    pub opencode_host: String,
-    /// Maximum wait time for the `OpenCode` server.
+    /// Port used by an agent `serve` command.
+    #[serde(alias = "opencode_port")]
+    pub serve_port: u16,
+    /// Host used by an agent `serve` command and its attach client.
+    #[serde(alias = "opencode_host")]
+    pub serve_host: String,
+    /// Maximum wait time for a server to become ready.
     pub startup_timeout_secs: u64,
     /// Delay between readiness probes.
     pub poll_interval_ms: u64,
 }
 
-/// Agent command and default tmux session name.
+/// Client/server commands for an agent that exposes a long-lived server.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct AgentServe {
+    /// Command that starts the server, e.g. `opencode serve`.
+    pub command: String,
+    /// Command that attaches to the server, e.g. `opencode attach`.
+    pub attach: String,
+}
+
+/// Agent command and default session name.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct AgentConfig {
-    /// Command executed inside the tmux session.
+    /// Command executed for an interactive agent session.
     pub command: String,
     /// Session name used when no explicit session is provided.
     pub default_session: String,
+    /// Optional client/server commands for the agent.
+    pub serve: Option<AgentServe>,
 }
 
 impl Default for Config {
@@ -212,6 +244,14 @@ impl Default for Config {
             agents: BTreeMap::from([
                 ("claude".into(), AgentConfig::new("claude", "claude")),
                 ("gemini".into(), AgentConfig::new("gemini", "gemini")),
+                (
+                    "opencode".into(),
+                    AgentConfig::with_serve(
+                        "opencode",
+                        "opencode",
+                        AgentServe::new("opencode serve", "opencode attach"),
+                    ),
+                ),
                 ("oc-tui".into(), AgentConfig::new("opencode", "opencode")),
             ]),
         }
@@ -227,6 +267,9 @@ impl Default for GeneralConfig {
             runtime_base_dir: "/tmp".into(),
             forbidden_dirs: vec!["/".into(), "/tmp".into()],
             shell: "/run/ai-env/bin/zsh".into(),
+            default_agent: "shell".into(),
+            session_backend: SessionBackend::Direct,
+            ocelot_path: "/run/ai-env/bin/ocelot".into(),
             podman_binary: "podman".into(),
         }
     }
@@ -334,18 +377,38 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             default_tmux_session: "main".into(),
-            opencode_port: 4096,
-            opencode_host: "127.0.0.1".into(),
+            serve_port: 4096,
+            serve_host: "127.0.0.1".into(),
             startup_timeout_secs: 15,
             poll_interval_ms: 250,
         }
     }
 }
 
+impl AgentServe {
+    /// Creates a client/server definition for an agent.
+    pub fn new(command: impl Into<String>, attach: impl Into<String>) -> Self {
+        Self { command: command.into(), attach: attach.into() }
+    }
+}
+
 impl AgentConfig {
-    /// Creates an agent definition.
+    /// Creates an interactive-only agent definition.
     pub fn new(command: impl Into<String>, default_session: impl Into<String>) -> Self {
-        Self { command: command.into(), default_session: default_session.into() }
+        Self { command: command.into(), default_session: default_session.into(), serve: None }
+    }
+
+    /// Creates an agent definition with client/server commands.
+    pub fn with_serve(
+        command: impl Into<String>,
+        default_session: impl Into<String>,
+        serve: AgentServe,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            default_session: default_session.into(),
+            serve: Some(serve),
+        }
     }
 }
 
@@ -411,12 +474,27 @@ impl Config {
             error::InvalidConfigSnafu { message: "general.ai_env_path must not be empty" }
         );
         snafu::ensure!(
+            !self.general.default_agent.is_empty(),
+            error::InvalidConfigSnafu { message: "general.default_agent must not be empty" }
+        );
+        snafu::ensure!(
+            self.general.default_agent == "shell"
+                || self.agents.contains_key(&self.general.default_agent),
+            error::InvalidConfigSnafu {
+                message: "general.default_agent must be `shell` or a defined agent"
+            }
+        );
+        snafu::ensure!(
+            !self.general.ocelot_path.is_empty(),
+            error::InvalidConfigSnafu { message: "general.ocelot_path must not be empty" }
+        );
+        snafu::ensure!(
             self.container.workdir.starts_with('/'),
             error::InvalidConfigSnafu { message: "container.workdir must be an absolute path" }
         );
         snafu::ensure!(
-            self.server.opencode_port > 0,
-            error::InvalidConfigSnafu { message: "server.opencode_port must be greater than zero" }
+            self.server.serve_port > 0,
+            error::InvalidConfigSnafu { message: "server.serve_port must be greater than zero" }
         );
         snafu::ensure!(
             self.server.startup_timeout_secs > 0,
@@ -430,12 +508,22 @@ impl Config {
                 message: "server.poll_interval_ms must be greater than zero"
             }
         );
+        for (name, agent) in &self.agents {
+            if let Some(serve) = &agent.serve {
+                snafu::ensure!(
+                    !serve.command.is_empty() && !serve.attach.is_empty(),
+                    error::InvalidConfigSnafu {
+                        message: format!("agents.{name}.serve requires command and attach")
+                    }
+                );
+            }
+        }
         Ok(())
     }
 
-    /// Returns the URL used by `opencode attach`.
-    pub fn opencode_url(&self) -> String {
-        format!("http://{}:{}", self.server.opencode_host, self.server.opencode_port)
+    /// Returns the URL passed to an agent's attach command.
+    pub fn serve_url(&self) -> String {
+        format!("http://{}:{}", self.server.serve_host, self.server.serve_port)
     }
 }
 
@@ -453,11 +541,17 @@ pub fn expand_path(input: &Path, home: &Path) -> PathBuf {
     PathBuf::from(expand_str(&input.to_string_lossy(), home))
 }
 
+/// Splits a configured command string into program and arguments.
+#[inline]
+pub fn split_command(command: &str) -> Vec<String> {
+    command.split_whitespace().map(str::to_owned).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{Config, DEFAULT_CONFIG_TEMPLATE, expand_path};
+    use super::{Config, DEFAULT_CONFIG_TEMPLATE, SessionBackend, expand_path};
 
     #[test]
     fn default_template_parses_to_default_config() {
@@ -475,10 +569,36 @@ general:
   container_prefix: custom
 ";
         let config: Config = serde_yaml::from_str(partial).expect("partial config should parse");
-        assert_eq!(config.server.opencode_port, 5000);
+        assert_eq!(config.server.serve_port, 5000);
         assert_eq!(config.general.container_prefix, "custom");
         assert_eq!(config.general.ai_env_path, Config::default().general.ai_env_path);
-        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.agents.len(), 4);
+        assert_eq!(config.general.default_agent, "shell");
+        assert_eq!(config.general.session_backend, SessionBackend::Direct);
+        assert_eq!(
+            config.agents["opencode"].serve.as_ref().expect("opencode serve").command,
+            "opencode serve"
+        );
+    }
+
+    #[test]
+    fn new_server_keys_parse_and_keep_aliases() {
+        let config: Config = serde_yaml::from_str(
+            r"
+server:
+  serve_port: 6000
+  serve_host: 0.0.0.0
+general:
+  default_agent: gemini
+  session_backend: tmux
+",
+        )
+        .expect("new keys should parse");
+        assert_eq!(config.server.serve_port, 6000);
+        assert_eq!(config.server.serve_host, "0.0.0.0");
+        assert_eq!(config.general.default_agent, "gemini");
+        assert_eq!(config.general.session_backend, SessionBackend::Tmux);
+        assert_eq!(config.serve_url(), "http://0.0.0.0:6000");
     }
 
     #[test]
@@ -504,6 +624,13 @@ general:
     fn validate_requires_absolute_workdir() {
         let mut config = Config::default();
         config.container.workdir = "workspace".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_default_agent() {
+        let mut config = Config::default();
+        config.general.default_agent = "missing".into();
         assert!(config.validate().is_err());
     }
 }

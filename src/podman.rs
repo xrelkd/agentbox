@@ -132,6 +132,7 @@ pub struct ContainerSpec {
     rootfs_overlay: bool,
     init_shell: String,
     init_script: String,
+    use_init: bool,
     read_only: bool,
     no_new_privileges: bool,
     drop_all_caps: bool,
@@ -155,6 +156,7 @@ pub struct ContainerSpecBuilder {
     rootfs_overlay: bool,
     init_shell: Option<String>,
     init_script: Option<String>,
+    use_init: bool,
     read_only: bool,
     no_new_privileges: bool,
     drop_all_caps: bool,
@@ -184,6 +186,14 @@ impl TcpProbe {
     fn script(&self) -> String {
         format!("exec 3<>/dev/tcp/{}/{}", shell_quote(&self.host), self.port)
     }
+}
+
+/// Flag set used when building `podman exec` arguments.
+#[derive(Clone, Copy)]
+enum ExecFlags {
+    Plain,
+    Interactive,
+    Detached,
 }
 
 /// Thin wrapper around every Podman invocation used by agentbox.
@@ -225,7 +235,22 @@ impl PodmanClient {
 
     /// Executes a command inside a container and waits for completion.
     pub fn exec(&self, name: &str, command: &[&str], workdir: Option<&Path>) -> Result<()> {
-        let args = Self::exec_args(name, command, workdir, false);
+        let args = Self::exec_args(name, command, workdir, ExecFlags::Plain);
+        let output = self.run(&args, true)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(command_failure("podman exec", &output))
+    }
+
+    /// Starts a command inside a container without waiting for it to finish.
+    pub fn exec_detached(
+        &self,
+        name: &str,
+        command: &[&str],
+        workdir: Option<&Path>,
+    ) -> Result<()> {
+        let args = Self::exec_args(name, command, workdir, ExecFlags::Detached);
         let output = self.run(&args, true)?;
         if output.status.success() {
             return Ok(());
@@ -240,7 +265,7 @@ impl PodmanClient {
         command: &[&str],
         workdir: Option<&Path>,
     ) -> Result<String> {
-        let args = Self::exec_args(name, command, workdir, false);
+        let args = Self::exec_args(name, command, workdir, ExecFlags::Plain);
         let output = self.run(&args, true)?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
@@ -255,7 +280,7 @@ impl PodmanClient {
         command: &[&str],
         workdir: Option<&Path>,
     ) -> Result<()> {
-        let args = Self::exec_args(name, command, workdir, true);
+        let args = Self::exec_args(name, command, workdir, ExecFlags::Interactive);
         tracing::debug!("Attaching with: podman {}", os_args_to_string(&args));
         let error = Command::new(&self.binary).args(args).exec();
         Err(error::Error::ExecReplace { source: error })
@@ -332,7 +357,8 @@ impl PodmanClient {
                 });
             }
 
-            let probe_output = self.run(&Self::exec_args(name, &command, None, false), true)?;
+            let probe_output =
+                self.run(&Self::exec_args(name, &command, None, ExecFlags::Plain), true)?;
             if probe_output.status.success() {
                 return Ok(());
             }
@@ -349,10 +375,17 @@ impl PodmanClient {
         }
     }
 
-    fn exec_args(name: &str, command: &[&str], workdir: Option<&Path>, tty: bool) -> Vec<OsString> {
+    fn exec_args(
+        name: &str,
+        command: &[&str],
+        workdir: Option<&Path>,
+        flags: ExecFlags,
+    ) -> Vec<OsString> {
         let mut args = vec![OsString::from("exec")];
-        if tty {
-            args.push(OsString::from("-it"));
+        match flags {
+            ExecFlags::Plain => {}
+            ExecFlags::Interactive => args.push(OsString::from("-it")),
+            ExecFlags::Detached => args.push(OsString::from("-d")),
         }
         if let Some(directory) = workdir {
             args.push(OsString::from("-w"));
@@ -383,9 +416,11 @@ impl ContainerSpec {
     }
 
     fn build_args(&self) -> Vec<OsString> {
-        let mut args = vec![
-            OsString::from("run"),
-            OsString::from("-d"),
+        let mut args = vec![OsString::from("run"), OsString::from("-d")];
+        if self.use_init {
+            args.push(OsString::from("--init"));
+        }
+        args.extend([
             OsString::from("--name"),
             OsString::from(&self.name),
             OsString::from("--hostname"),
@@ -395,7 +430,7 @@ impl ContainerSpec {
             OsString::from("--userns=keep-id"),
             OsString::from("--user"),
             OsString::from(format!("{}:{}", self.uid, self.gid)),
-        ];
+        ]);
 
         if self.read_only {
             args.push(OsString::from("--read-only"));
@@ -471,6 +506,7 @@ impl ContainerSpecBuilder {
             rootfs_overlay: true,
             init_shell: None,
             init_script: None,
+            use_init: false,
             read_only: false,
             no_new_privileges: false,
             drop_all_caps: false,
@@ -522,6 +558,12 @@ impl ContainerSpecBuilder {
     /// Sets the container init script.
     pub fn init_script(mut self, script: impl Into<String>) -> Self {
         self.init_script = Some(script.into());
+        self
+    }
+
+    /// Enables Podman's host-provided init process for the fallback runtime.
+    pub const fn init(mut self, enabled: bool) -> Self {
+        self.use_init = enabled;
         self
     }
 
@@ -593,6 +635,7 @@ impl ContainerSpecBuilder {
             init_script: self
                 .init_script
                 .with_context(|| error::MissingFieldSnafu { field: "init_script" })?,
+            use_init: self.use_init,
             read_only: self.read_only,
             no_new_privileges: self.no_new_privileges,
             drop_all_caps: self.drop_all_caps,
@@ -628,9 +671,11 @@ fn command_failure(program: &str, output: &Output) -> error::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{ffi::OsString, path::PathBuf};
 
-    use super::{ContainerSpec, ContainerStatus, Mount, TcpProbe, shell_quote};
+    use super::{
+        ContainerSpec, ContainerStatus, ExecFlags, Mount, PodmanClient, TcpProbe, shell_quote,
+    };
     use crate::error::Error;
 
     fn minimal_spec() -> ContainerSpec {
@@ -640,7 +685,7 @@ mod tests {
             .user(1000, 1000)
             .rootfs(PathBuf::from("/tmp/rootfs"))
             .init_shell("/run/ai-env/bin/bash")
-            .init_script("exec opencode serve")
+            .init_script("exec sleep infinity")
             .read_only(true)
             .no_new_privileges(true)
             .drop_all_caps(true)
@@ -667,6 +712,37 @@ mod tests {
         assert!(strings.contains(&"--rootfs".into()));
         assert!(strings.contains(&"/tmp/rootfs:O".into()));
         assert!(strings.contains(&"OPENROUTER_API_KEY=super-secret".into()));
+    }
+
+    #[test]
+    fn init_flag_is_emitted_only_when_enabled() {
+        let without_init = minimal_spec().build_args();
+        assert!(!without_init.iter().any(|arg| arg == "--init"));
+
+        let spec = ContainerSpec::builder("agentbox-init")
+            .hostname("sandbox-init")
+            .workdir(PathBuf::from("/workspace"))
+            .user(1000, 1000)
+            .rootfs(PathBuf::from("/tmp/rootfs"))
+            .init_shell("/run/ai-env/bin/bash")
+            .init_script("exec sleep infinity")
+            .init(true)
+            .build()
+            .expect("spec should build");
+        assert!(spec.build_args().iter().any(|arg| arg.to_string_lossy() == "--init"));
+    }
+
+    #[test]
+    fn exec_modes_generate_expected_flags() {
+        let interactive =
+            PodmanClient::exec_args("container", &["zsh", "-i"], None, ExecFlags::Interactive);
+        assert_eq!(interactive[0], "exec");
+        assert_eq!(interactive[1], "-it");
+
+        let detached =
+            PodmanClient::exec_args("container", &["opencode", "serve"], None, ExecFlags::Detached);
+        assert_eq!(detached[1], "-d");
+        assert!(detached.contains(&OsString::from("opencode")));
     }
 
     #[test]

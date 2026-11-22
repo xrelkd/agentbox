@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod error;
+mod ocelot;
 mod podman;
 mod rootfs;
 mod workspace;
