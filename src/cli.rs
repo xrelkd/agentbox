@@ -70,8 +70,15 @@ pub enum Command {
     /// Print the host temporary directory for this project.
     Tmp,
 
+    /// Print the persistent home directory for this project.
+    Home,
+
     /// Stop the project container and clean temporary directories.
-    Stop,
+    Stop {
+        /// Also remove the persistent home directory.
+        #[arg(long)]
+        purge_home: bool,
+    },
 
     /// List agentbox-managed containers.
     #[command(aliases = ["ps", "ls"])]
@@ -148,7 +155,11 @@ impl Cli {
                 app.temporary_dir();
                 Ok(())
             }
-            Command::Stop => app.stop(),
+            Command::Home => {
+                app.home_dir();
+                Ok(())
+            }
+            Command::Stop { purge_home } => app.stop(purge_home),
             Command::List => app.list(),
             Command::Completions { .. } | Command::Config { .. } => Ok(()),
         }
@@ -202,6 +213,19 @@ mod tests {
             cli.selected_command(),
             Command::Completions { shell: clap_complete::Shell::Zsh }
         ));
+    }
+
+    #[test]
+    fn parses_persistent_home_commands() {
+        let home = Cli::try_parse_from(["agentbox", "home"]).expect("parse home");
+        assert!(matches!(home.selected_command(), Command::Home));
+
+        let stop = Cli::try_parse_from(["agentbox", "stop", "--purge-home"])
+            .expect("parse stop with purge home");
+        assert!(matches!(stop.selected_command(), Command::Stop { purge_home: true }));
+
+        let stop = Cli::try_parse_from(["agentbox", "stop"]).expect("parse stop");
+        assert!(matches!(stop.selected_command(), Command::Stop { purge_home: false }));
     }
 
     #[test]

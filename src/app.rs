@@ -37,6 +37,11 @@ impl App {
         println!("{}", self.identity.tmp_dir.display());
     }
 
+    /// Prints the host directory mounted as the persistent container home.
+    pub fn home_dir(&self) {
+        println!("{}", self.identity.home_dir.display());
+    }
+
     /// Lists agentbox-managed containers.
     pub fn list(&self) -> Result<()> {
         let prefix = &self.config.general.container_prefix;
@@ -48,8 +53,8 @@ impl App {
         Ok(())
     }
 
-    /// Stops the project container and removes its temporary directories.
-    pub fn stop(&self) -> Result<()> {
+    /// Stops the project container and removes its transient directories.
+    pub fn stop(&self, purge_home: bool) -> Result<()> {
         let name = &self.identity.container_name;
         if self.podman.container_exists(name)? {
             tracing::info!("Stopping and removing container: {name}");
@@ -58,11 +63,15 @@ impl App {
             tracing::info!("No container found for the current project: {name}");
         }
 
-        for directory in [&self.identity.meta_dir, &self.identity.tmp_dir] {
+        let mut directories = vec![&self.identity.meta_dir, &self.identity.tmp_dir];
+        if purge_home {
+            directories.push(&self.identity.home_dir);
+        }
+        for directory in directories {
             if directory.exists() {
                 fs::remove_dir_all(directory)
                     .with_context(|_| error::RemoveDirSnafu { path: directory.clone() })?;
-                tracing::info!("Cleaned up temporary directory: {}", directory.display());
+                tracing::info!("Cleaned up directory: {}", directory.display());
             }
         }
         Ok(())
@@ -231,6 +240,7 @@ impl App {
         };
 
         add(self.identity.tmp_dir.clone(), PathBuf::from("/tmp"), false);
+        add(self.identity.home_dir.clone(), self.home.clone(), false);
 
         let store = self.expand_config_path(&config.nix.store_path);
         add(store.clone(), store, true);
@@ -302,17 +312,10 @@ impl App {
     }
 
     fn build_tmpfs(&self) -> Vec<Tmpfs> {
-        let config = &self.config;
-        vec![
-            Tmpfs::new(
-                PathBuf::from("/var/tmp"),
-                format!("rw,nosuid,size={}", config.container.var_tmp_size),
-            ),
-            Tmpfs::new(
-                self.home.join(".cache"),
-                format!("rw,nosuid,size={}", config.container.cache_tmpfs_size),
-            ),
-        ]
+        vec![Tmpfs::new(
+            PathBuf::from("/var/tmp"),
+            format!("rw,nosuid,size={}", self.config.container.var_tmp_size),
+        )]
     }
 
     fn build_env(&self, shell: &str) -> Vec<(String, String)> {
@@ -361,6 +364,7 @@ impl App {
             "TERM",
             env::var("TERM").unwrap_or_else(|_| config.environment.default_term.clone()),
         );
+        push_env(&mut variables, "TMUX_TMPDIR", "/var/tmp".to_owned());
 
         for (key, value) in &config.environment.extra_env {
             variables.push((key.clone(), self.expand_config_value(value)));
@@ -434,4 +438,67 @@ fn kernel_release() -> Option<String> {
     }
     let release = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if release.is_empty() { None } else { Some(release) }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::App;
+    use crate::{
+        config::Config,
+        workspace::{HostIdentity, ProjectIdentity},
+    };
+
+    fn app() -> App {
+        let home = PathBuf::from("/home/tester");
+        let identity = ProjectIdentity {
+            project_dir: PathBuf::from("/work/project"),
+            name: "project".into(),
+            hash: "deadbeef".into(),
+            container_name: "agentbox-project-deadbeef".into(),
+            tmp_dir: PathBuf::from("/tmp/agentbox-tmp-1000-project-deadbeef"),
+            home_dir: PathBuf::from("/tmp/agentbox-home-1000-project-deadbeef"),
+            meta_dir: PathBuf::from("/tmp/agentbox-meta-1000-project-deadbeef"),
+            rootfs_dir: PathBuf::from("/tmp/agentbox-meta-1000-project-deadbeef/rootfs"),
+            host: HostIdentity {
+                uid: 1000,
+                gid: 1000,
+                username: "tester".into(),
+                home: home.clone(),
+            },
+        };
+        let mut config = Config::default();
+        config.nix.enable_daemon_mount = false;
+        config.nix.mount_kernel_modules = false;
+        App::new(config, identity, home)
+    }
+
+    #[test]
+    fn home_mount_precedes_nested_state_mounts() {
+        let app = app();
+        let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
+        let home_index =
+            mounts.iter().position(|mount| mount.container == app.home).expect("home mount");
+        let agents_index = mounts
+            .iter()
+            .position(|mount| mount.container == app.home.join(".agents"))
+            .expect("state mount");
+
+        assert_eq!(mounts[home_index].host, app.identity.home_dir);
+        assert!(home_index < agents_index);
+    }
+
+    #[test]
+    fn only_var_tmp_uses_tmpfs() {
+        let tmpfs = app().build_tmpfs();
+        assert_eq!(tmpfs.len(), 1);
+        assert_eq!(tmpfs[0].target, PathBuf::from("/var/tmp"));
+    }
+
+    #[test]
+    fn tmux_sockets_are_kept_on_tmpfs() {
+        let env = app().build_env("/bin/sh");
+        assert!(env.contains(&("TMUX_TMPDIR".to_owned(), "/var/tmp".to_owned())));
+    }
 }

@@ -15,9 +15,9 @@ general:
   ai_env_path: "~/.local/share/agentbox-env"
   # Mount point for ai_env_path inside the container.
   ai_env_mount_path: "/run/ai-env"
-  # Prefix for generated container, temporary, and metadata names.
+  # Prefix for generated container, home, temporary, and metadata names.
   container_prefix: "agentbox"
-  # Host base directory used for temporary and metadata directories.
+  # Host base directory used for home, temporary, and metadata directories.
   runtime_base_dir: "/tmp"
   # Project directories that agentbox refuses to run from.
   forbidden_dirs: ["/", "/tmp"]
@@ -44,8 +44,6 @@ container:
   memory_limit: "12g"
   # Size of the /var/tmp tmpfs.
   var_tmp_size: "2g"
-  # Size of the $HOME/.cache tmpfs.
-  cache_tmpfs_size: "2g"
   # Mount the generated root filesystem as an overlay.
   rootfs_overlay: true
 
@@ -73,6 +71,8 @@ nix:
   host_cache_dir: "~/.cache/nix"
 
 # Host-to-container mount declarations.
+# The per-project persistent home is mounted first at $HOME; entries below are
+# mounted on top of it. `agentbox stop` keeps it unless --purge-home is given.
 mounts:
   # State directories created on the host and mounted read-write.
   state_dirs:
@@ -127,7 +127,7 @@ environment:
   pkg_config_path: "/run/ai-env/lib/pkgconfig:/run/ai-env/share/pkgconfig"
   # Container LANG and LC_ALL.
   lang: "C.UTF-8"
-  # Container HISTFILE.
+  # Container HISTFILE, stored in the persistent home directory.
   histfile: "~/.cache/zsh_history"
   # TERM used when the host does not provide one.
   default_term: "xterm-256color"

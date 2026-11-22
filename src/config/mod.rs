@@ -42,9 +42,9 @@ pub struct GeneralConfig {
     pub ai_env_path: String,
     /// Container path where `ai_env_path` is mounted read-only.
     pub ai_env_mount_path: String,
-    /// Prefix used for generated container, temp, and metadata directory names.
+    /// Prefix used for generated container, home, temp, and metadata names.
     pub container_prefix: String,
-    /// Host base directory for temporary and metadata directories.
+    /// Host base directory for home, temporary, and metadata directories.
     pub runtime_base_dir: String,
     /// Project directories that are rejected before any container is created.
     pub forbidden_dirs: Vec<String>,
@@ -78,8 +78,6 @@ pub struct ContainerConfig {
     pub memory_limit: String,
     /// Size of the `/var/tmp` tmpfs.
     pub var_tmp_size: String,
-    /// Size of the `$HOME/.cache` tmpfs.
-    pub cache_tmpfs_size: String,
     /// Mount the generated rootfs as an overlay (`O`).
     pub rootfs_overlay: bool,
 }
@@ -245,7 +243,6 @@ impl Default for ContainerConfig {
             pids_limit: 1024,
             memory_limit: "12g".into(),
             var_tmp_size: "2g".into(),
-            cache_tmpfs_size: "2g".into(),
             rootfs_overlay: true,
         }
     }

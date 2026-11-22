@@ -51,6 +51,8 @@ pub struct ProjectIdentity {
     pub container_name: String,
     /// Host temporary directory mounted at `/tmp` in the container.
     pub tmp_dir: PathBuf,
+    /// Host directory mounted as the persistent container home directory.
+    pub home_dir: PathBuf,
     /// Host metadata directory containing the generated rootfs.
     pub meta_dir: PathBuf,
     /// Generated rootfs directory.
@@ -77,6 +79,7 @@ impl ProjectIdentity {
         let host = HostIdentity::detect(home.to_path_buf())?;
         let container_name = format!("{prefix}-{name}-{hash}");
         let tmp_dir = base.join(format!("{prefix}-tmp-{}-{name}-{hash}", host.uid));
+        let home_dir = base.join(format!("{prefix}-home-{}-{name}-{hash}", host.uid));
         let meta_dir = base.join(format!("{prefix}-meta-{}-{name}-{hash}", host.uid));
 
         Ok(Self {
@@ -85,6 +88,7 @@ impl ProjectIdentity {
             hash,
             container_name,
             tmp_dir,
+            home_dir,
             rootfs_dir: meta_dir.join("rootfs"),
             meta_dir,
             host,
@@ -228,6 +232,7 @@ mod tests {
             hash: hash.clone(),
             container_name: format!("agentbox-my-project-{hash}"),
             tmp_dir: PathBuf::from("/tmp/agentbox-tmp-1000-my-project-hash"),
+            home_dir: PathBuf::from("/tmp/agentbox-home-1000-my-project-hash"),
             meta_dir: PathBuf::from("/tmp/agentbox-meta-1000-my-project-hash"),
             rootfs_dir: PathBuf::from("/tmp/agentbox-meta-1000-my-project-hash/rootfs"),
             host,
@@ -237,6 +242,7 @@ mod tests {
         assert_eq!(identity.hash.len(), 8);
         assert!(identity.container_name.starts_with("agentbox-my-project-"));
         assert!(identity.tmp_dir.to_string_lossy().starts_with("/tmp/agentbox-tmp-"));
+        assert!(identity.home_dir.to_string_lossy().starts_with("/tmp/agentbox-home-"));
         assert!(identity.rootfs_dir.starts_with(&identity.meta_dir));
     }
 }

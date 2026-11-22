@@ -16,13 +16,21 @@ use crate::{
 /// shell.
 pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) -> Result<String> {
     let home = &identity.host.home;
+    create_dir_all(&identity.home_dir)?;
     for mount in &config.mounts.state_dirs {
         let host = config::expand_path(Path::new(&mount.host), home);
         create_dir_all(&host)?;
+        create_persistent_home_path(&identity.home_dir, &mount.container, home, true)?;
     }
 
-    create_dir_all(&config::expand_path(Path::new(&config.nix.host_config_dir), home))?;
+    let nix_config = &config::expand_path(Path::new(&config.nix.host_config_dir), home);
+    create_dir_all(nix_config)?;
+    create_persistent_home_path(&identity.home_dir, &config.nix.host_config_dir, home, true)?;
     create_dir_all(&config::expand_path(Path::new(&config.nix.host_cache_dir), home))?;
+
+    for mount in config.mounts.optional_ro_mounts.iter().chain(&config.mounts.extra_mounts) {
+        create_persistent_home_path(&identity.home_dir, &mount.container, home, false)?;
+    }
 
     create_dir_all(&identity.tmp_dir)?;
     fs::set_permissions(&identity.tmp_dir, fs::Permissions::from_mode(0o1777))
@@ -36,6 +44,10 @@ pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) 
     }
     if !relative_workdir.as_os_str().is_empty() {
         create_dir_all(&rootfs.join(relative_workdir))?;
+    }
+    let relative_home = home.strip_prefix("/").unwrap_or(home);
+    if !relative_home.as_os_str().is_empty() {
+        create_dir_all(&rootfs.join(relative_home))?;
     }
 
     let env_mount = config.general.ai_env_mount_path.trim_end_matches('/');
@@ -128,6 +140,30 @@ fn create_dir_all(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|_| error::CreateDirSnafu { path: path.to_path_buf() })
 }
 
+fn create_persistent_home_path(
+    home_dir: &Path,
+    raw_container_path: &str,
+    home: &Path,
+    include_target: bool,
+) -> Result<()> {
+    let container_path = config::expand_path(Path::new(raw_container_path), home);
+    let Ok(relative) = container_path.strip_prefix(home) else {
+        return Ok(());
+    };
+    let relative = if include_target {
+        relative
+    } else {
+        let Some(parent) = relative.parent() else {
+            return Ok(());
+        };
+        parent
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+    create_dir_all(&home_dir.join(relative))
+}
+
 #[inline]
 fn write_file(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).with_context(|_| error::WriteFileSnafu { path: path.to_path_buf() })
@@ -172,6 +208,7 @@ mod tests {
             hash: "deadbeef".into(),
             container_name: "agentbox-project-deadbeef".into(),
             tmp_dir: root.join("tmp"),
+            home_dir: root.join("persistent-home"),
             meta_dir: root.join("meta"),
             rootfs_dir: root.join("meta/rootfs"),
             host: HostIdentity {
@@ -217,6 +254,10 @@ mod tests {
             assert!(project.rootfs_dir.join(directory).is_dir(), "missing {directory}");
         }
         assert!(project.tmp_dir.join(".").is_dir());
+        assert!(project.home_dir.join(".agents").is_dir());
+        assert!(project.home_dir.join(".config/nix").is_dir());
+        let relative_home = project.host.home.strip_prefix("/").unwrap_or(&project.host.home);
+        assert!(project.rootfs_dir.join(relative_home).is_dir());
         assert_eq!(
             fs::read_link(project.rootfs_dir.join("bin/sh")).expect("sh symlink"),
             PathBuf::from("/run/ai-env/bin/sh")
