@@ -86,7 +86,7 @@ fn dependencies() -> BTreeMap<String, DependencyConfig> {
 }
 
 /// Renders the hardcoded supervise configuration for the project container.
-pub fn render_config(config: &Config) -> Result<String> {
+pub fn render_config(config: &Config, ocelot_path: &str) -> Result<String> {
     let serve = config
         .agents
         .get("opencode")
@@ -108,7 +108,7 @@ pub fn render_config(config: &Config) -> Result<String> {
     arguments.push(listen_host);
 
     let keeper = ProcessConfig {
-        program: config.general.ocelot_path.clone(),
+        program: ocelot_path.to_owned(),
         arguments: vec!["idle".into()],
         working_directory: None,
         depends_on: None,

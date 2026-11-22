@@ -54,7 +54,7 @@ impl App {
     /// identity.
     pub fn new(config: Config, identity: ProjectIdentity, home: PathBuf) -> Self {
         let ai_env = config::expand_path(Path::new(&config.general.ai_env_path), &home);
-        let shell = rootfs::select_shell(&config, &ai_env, &config.general.ai_env_mount_path);
+        let shell = rootfs::select_shell(&config, &ai_env);
         let podman = PodmanClient::new(config.general.podman_binary.clone());
         Self { config, identity, podman, home, shell }
     }
@@ -244,7 +244,7 @@ impl App {
         let ai_env_path = self.ai_env_path()?;
         drop(rootfs::prepare(&self.config, &self.identity, &ai_env_path)?);
         if runtime.mode == InitMode::Ocelot {
-            self.write_ocelot_config()?;
+            self.write_ocelot_config(&ai_env_path)?;
         }
         let spec = self.build_spec(&ai_env_path, runtime.mode)?;
         self.podman.run_detached(&spec)?;
@@ -253,7 +253,7 @@ impl App {
 
     fn runtime(&self) -> Runtime {
         let mode = if self.is_ocelot_available() { InitMode::Ocelot } else { InitMode::Fallback };
-        Runtime { mode, shell: self.shell.clone(), probe_shell: self.init_shell() }
+        Runtime { mode, shell: self.shell.clone(), probe_shell: Self::init_shell() }
     }
 
     fn build_attach_command(&self, agent_name: &str, serve: &AgentServe) -> Result<Vec<String>> {
@@ -270,16 +270,13 @@ impl App {
 
     fn is_ocelot_available(&self) -> bool {
         let ai_env = self.expand_config_path(&self.config.general.ai_env_path);
-        let host = rootfs::container_path_to_host(
-            &self.config.general.ocelot_path,
-            &self.config.general.ai_env_mount_path,
-            &ai_env,
-        );
+        let (_, host) = rootfs::resolve_tool(&self.config.general.ocelot_path, &ai_env);
         is_executable(&host)
     }
 
-    fn write_ocelot_config(&self) -> Result<()> {
-        let yaml = ocelot::render_config(&self.config)?;
+    fn write_ocelot_config(&self, ai_env_path: &Path) -> Result<()> {
+        let (ocelot, _) = rootfs::resolve_tool(&self.config.general.ocelot_path, ai_env_path);
+        let yaml = ocelot::render_config(&self.config, &ocelot)?;
         let target = self.identity.rootfs_dir.join(OCELOT_CONFIG_PATH.trim_start_matches('/'));
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
@@ -308,7 +305,7 @@ impl App {
         let serve_command =
             arguments.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>().join(" ");
         let script = format!("if [ ! -f {marker} ]; then touch {marker}; exec {serve_command}; fi");
-        let shell = self.init_shell();
+        let shell = Self::init_shell();
         let command = [shell.as_str(), "-c", script.as_str()];
         let workdir = self.expand_config_path(&self.config.container.workdir);
         self.podman.exec_detached(&self.identity.container_name, &command, Some(&workdir))
@@ -326,8 +323,9 @@ impl App {
         let config = &self.config;
         let identity = &self.identity;
         let workdir = self.expand_config_path(&config.container.workdir);
-        let init_shell = self.init_shell();
-        let init_script = init_script_for(config, &init_shell, mode);
+        let init_shell = Self::init_shell();
+        let (ocelot, _) = rootfs::resolve_tool(&config.general.ocelot_path, ai_env_path);
+        let init_script = init_script_for(&init_shell, mode, &ocelot);
 
         let mut builder = ContainerSpec::builder(identity.container_name.clone())
             .hostname(format!("{}-{}", config.container.hostname_prefix, identity.name))
@@ -396,7 +394,7 @@ impl App {
             }
         }
 
-        let mount_path = PathBuf::from(&config.general.ai_env_mount_path);
+        let mount_path = PathBuf::from(config::AI_ENV_MOUNT_PATH);
         add(ai_env_path.to_path_buf(), mount_path, true);
 
         if config.nix.mount_kernel_modules
@@ -417,24 +415,10 @@ impl App {
             }
         }
 
-        for entry in &config.mounts.state_dirs {
+        for entry in &config.mounts {
             let host = self.expand_config_path(&entry.host);
-            if entry.skip_if_missing && !host.exists() {
-                tracing::debug!("Skipping missing state directory {}", host.display());
-                continue;
-            }
-            add(host, self.expand_config_path(&entry.container), entry.read_only);
-        }
-        for entry in &config.mounts.optional_ro_mounts {
-            let host = self.expand_config_path(&entry.host);
-            if host.exists() {
-                add(host, self.expand_config_path(&entry.container), entry.read_only);
-            }
-        }
-        for entry in &config.mounts.extra_mounts {
-            let host = self.expand_config_path(&entry.host);
-            if entry.skip_if_missing && !host.exists() {
-                tracing::debug!("Skipping missing mount source {}", host.display());
+            if !host.exists() {
+                tracing::warn!("Skipping missing mount source {}", host.display());
                 continue;
             }
             add(host, self.expand_config_path(&entry.container), entry.read_only);
@@ -456,11 +440,14 @@ impl App {
         vec![
             Tmpfs::new(
                 PathBuf::from("/tmp"),
-                format!("rw,nosuid,nodev,size={}", self.config.container.tmp_size),
+                format!("rw,nosuid,nodev,mode=1777,size={}", self.config.container.tmp_size),
             ),
             Tmpfs::new(
                 PathBuf::from("/var/tmp"),
-                format!("rw,nosuid,nodev,noexec,size={}", self.config.container.var_tmp_size),
+                format!(
+                    "rw,nosuid,nodev,noexec,mode=1777,size={}",
+                    self.config.container.var_tmp_size
+                ),
             ),
         ]
     }
@@ -551,10 +538,7 @@ impl App {
     }
 
     #[inline]
-    fn init_shell(&self) -> String {
-        let mount = self.config.general.ai_env_mount_path.trim_end_matches('/');
-        format!("{mount}/bin/bash")
-    }
+    fn init_shell() -> String { format!("{}/bin/bash", config::AI_ENV_MOUNT_PATH) }
 
     #[inline]
     fn expand_config_path(&self, raw: &str) -> PathBuf {
@@ -576,11 +560,11 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-fn init_script_for(config: &Config, init_shell: &str, mode: InitMode) -> String {
+fn init_script_for(init_shell: &str, mode: InitMode, ocelot_path: &str) -> String {
     match mode {
         InitMode::Ocelot => {
             let file = shell_quote(OCELOT_CONFIG_PATH);
-            let ocelot = shell_quote(&config.general.ocelot_path);
+            let ocelot = shell_quote(ocelot_path);
             format!("exec {ocelot} supervise run --file {file}")
         }
         InitMode::Fallback => {
@@ -621,7 +605,7 @@ mod tests {
 
     use super::{App, InitMode, init_script_for};
     use crate::{
-        config::{AgentServe, Config},
+        config::{AgentServe, Config, MountEntry},
         ocelot::render_config,
         workspace::{HostIdentity, ProjectIdentity},
     };
@@ -652,7 +636,10 @@ mod tests {
 
     #[test]
     fn home_mount_precedes_nested_state_mounts() {
-        let app = app();
+        let mut app = app();
+        let temp = env::temp_dir();
+        app.config.mounts =
+            vec![MountEntry::new(temp.to_string_lossy(), "/home/tester/.agents", true)];
         let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
         let home_index =
             mounts.iter().position(|mount| mount.container == app.home).expect("home mount");
@@ -666,18 +653,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_mount_source_is_skipped() {
+        let mut app = app();
+        let missing =
+            env::temp_dir().join(format!("agentbox-missing-mount-{}", std::process::id()));
+        drop(fs::remove_dir_all(&missing));
+        let temp = env::temp_dir();
+        app.config.mounts = vec![
+            MountEntry::new(missing.to_string_lossy(), "/home/tester/missing", false),
+            MountEntry::new(temp.to_string_lossy(), "/home/tester/present", true),
+        ];
+
+        let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
+        assert!(!mounts.iter().any(|mount| mount.container == app.home.join("missing")));
+        assert!(mounts.iter().any(|mount| mount.container == app.home.join("present")));
+    }
+
+    #[test]
     fn temporary_directories_are_sized_tmpfs_mounts() {
         let tmpfs = app().build_tmpfs();
         assert_eq!(tmpfs.len(), 2);
         assert_eq!(tmpfs[0].target, PathBuf::from("/tmp"));
-        assert!(tmpfs[0].options.contains("nodev"));
+        assert_eq!(tmpfs[0].options, "rw,nosuid,nodev,mode=1777,size=2g");
         assert_eq!(tmpfs[1].target, PathBuf::from("/var/tmp"));
-        assert!(tmpfs[1].options.contains("noexec"));
+        assert_eq!(tmpfs[1].options, "rw,nosuid,nodev,noexec,mode=1777,size=2g");
     }
 
     #[test]
     fn configuration_directories_are_mounted_read_only() {
-        let app = app();
+        let mut app = app();
+        let temp = env::temp_dir();
+        app.config.mounts =
+            vec![MountEntry::new(temp.to_string_lossy(), "/home/tester/.claude", true)];
         let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
         let config = mounts
             .iter()
@@ -718,7 +725,9 @@ mod tests {
     #[test]
     fn ocelot_init_script_only_execs_supervise() {
         let config = Config::default();
-        let script = init_script_for(&config, "/run/ai-env/bin/bash", InitMode::Ocelot);
+        let (ocelot, _) =
+            crate::rootfs::resolve_tool(&config.general.ocelot_path, Path::new("/opt/ai-env"));
+        let script = init_script_for("/run/ai-env/bin/bash", InitMode::Ocelot, &ocelot);
 
         assert_eq!(
             script,
@@ -731,7 +740,7 @@ mod tests {
     #[test]
     fn probe_uses_bash_regardless_of_configured_shell() {
         let mut config = Config::default();
-        config.general.shell = "/run/ai-env/bin/zsh".into();
+        config.general.shell = "zsh".into();
         let home = PathBuf::from("/home/tester");
         let identity = app().identity;
         let app = App::new(config, identity, home);
@@ -784,8 +793,8 @@ mod tests {
 
     #[test]
     fn fallback_init_script_uses_keepalive() {
-        let config = Config::default();
-        let script = init_script_for(&config, "/run/ai-env/bin/bash", InitMode::Fallback);
+        let script =
+            init_script_for("/run/ai-env/bin/bash", InitMode::Fallback, "/run/ai-env/bin/ocelot");
 
         assert_eq!(script, "exec '/run/ai-env/bin/bash' -c 'exec sleep infinity'");
     }
@@ -799,24 +808,33 @@ mod tests {
 
         let mut app = app();
         app.identity.rootfs_dir = root.clone();
-        app.write_ocelot_config().expect("write ocelot config");
+        app.write_ocelot_config(Path::new("/opt/ai-env")).expect("write ocelot config");
 
         let written = fs::read_to_string(root.join("etc/agentbox/ocelot.yaml"))
             .expect("read generated ocelot config");
         let value: serde_yaml::Value = serde_yaml::from_str(&written).expect("parse yaml");
         assert_eq!(value["version"].as_str(), Some("1.0"));
+        assert_eq!(
+            value["processes"]["keeper"]["program"].as_str(),
+            Some("/run/ai-env/bin/ocelot")
+        );
 
         fs::remove_dir_all(&root).expect("cleanup temp rootfs");
     }
 
     #[test]
     fn rendered_ocelot_config_uses_generic_server_settings() {
-        let yaml = render_config(&Config::default()).expect("ocelot config");
+        let yaml =
+            render_config(&Config::default(), "/run/ai-env/bin/ocelot").expect("ocelot config");
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse ocelot config");
         let opencode = &value["processes"]["opencode"];
         let arguments = opencode["arguments"].as_sequence().expect("arguments");
 
         assert_eq!(value["version"].as_str(), Some("1.0"));
+        assert_eq!(
+            value["processes"]["keeper"]["program"].as_str(),
+            Some("/run/ai-env/bin/ocelot")
+        );
         assert_eq!(value["processes"]["keeper"]["arguments"][0].as_str(), Some("idle"));
         assert_eq!(opencode["program"].as_str(), Some("opencode"));
         assert_eq!(opencode["workingDirectory"].as_str(), Some("/workspace"));

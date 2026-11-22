@@ -27,7 +27,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH", env = "AGENTBOX_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Subcommand to run; defaults to `start` (detached container).
+    /// Subcommand to run; defaults to `list`.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -70,9 +70,6 @@ pub enum Command {
     #[command(alias = "oc")]
     Opencode,
 
-    /// Attach to an `OpenCode` TUI session in the running container.
-    OcTui,
-
     /// Attach to a Claude session in the running container.
     Claude,
 
@@ -102,11 +99,16 @@ pub enum Command {
 /// Configuration file actions.
 #[derive(Clone, Debug, Subcommand)]
 pub enum ConfigAction {
-    /// Write the default YAML configuration.
+    /// Write the minimal YAML configuration.
     Init {
         /// Overwrite an existing configuration file.
         #[arg(long)]
         force: bool,
+
+        /// Write the complete template instead of the minimal default. The
+        /// complete template documents every setting and all default mounts.
+        #[arg(long)]
+        full: bool,
     },
 
     /// Print the resolved configuration file path.
@@ -114,10 +116,8 @@ pub enum ConfigAction {
 }
 
 impl Cli {
-    /// Returns the selected command, defaulting to a detached container start.
-    pub fn command_or_default(&self) -> Command {
-        self.command.clone().unwrap_or(Command::Start { attach: false, agent: None })
-    }
+    /// Returns the selected command, defaulting to a container listing.
+    pub fn command_or_default(&self) -> Command { self.command.clone().unwrap_or(Command::List) }
 
     /// Executes the selected command.
     pub fn run(&self) -> Result<()> {
@@ -133,7 +133,9 @@ impl Cli {
             }
             Some(Command::Config { action }) => {
                 return match action {
-                    ConfigAction::Init { force } => Config::write_default(&config_path, *force),
+                    ConfigAction::Init { force, full } => {
+                        Config::write_default(&config_path, *force, *full)
+                    }
                     ConfigAction::Path => {
                         println!("{}", config_path.display());
                         Ok(())
@@ -150,9 +152,10 @@ impl Cli {
 
         match command {
             Command::Start { attach, agent } => app.start(agent.as_deref(), attach),
+            Command::Stop { purge_home } => app.stop_project(purge_home),
+            Command::List => app.list_containers(),
             Command::Agent { name } => app.launch_agent(&name),
             Command::Opencode => app.launch_agent("opencode"),
-            Command::OcTui => app.launch_agent("oc-tui"),
             Command::Claude => app.launch_agent("claude"),
             Command::Gemini => app.launch_agent("gemini"),
             Command::Shell => app.attach_shell(),
@@ -164,8 +167,6 @@ impl Cli {
                 app.print_home_dir();
                 Ok(())
             }
-            Command::Stop { purge_home } => app.stop_project(purge_home),
-            Command::List => app.list_containers(),
             Command::Completions { .. } | Command::Config { .. } => Ok(()),
         }
     }
@@ -180,17 +181,17 @@ mod tests {
     use super::{Cli, Command, ConfigAction};
 
     #[test]
-    fn defaults_to_detached_start() {
+    fn defaults_to_list() {
         let cli = Cli::try_parse_from(["agentbox"]).expect("parse empty args");
-        assert!(matches!(cli.command_or_default(), Command::Start { attach: false, agent: None }));
+        assert!(matches!(cli.command_or_default(), Command::List));
         assert_eq!(cli.verbose, 0);
     }
 
     #[test]
-    fn default_ignores_configured_agent() {
+    fn default_ignores_config_option() {
         let cli = Cli::try_parse_from(["agentbox", "--config", "/tmp/agentbox.yaml"])
             .expect("parse config option");
-        assert!(matches!(cli.command_or_default(), Command::Start { attach: false, agent: None }));
+        assert!(matches!(cli.command_or_default(), Command::List));
     }
 
     #[test]
@@ -262,13 +263,21 @@ mod tests {
             "config",
             "init",
             "--force",
+            "--full",
         ])
         .expect("parse config init");
         assert_eq!(cli.config, Some(std::path::PathBuf::from("/tmp/agentbox.yaml")));
         assert_eq!(cli.verbose, 2);
         assert!(matches!(
             cli.command,
-            Some(Command::Config { action: ConfigAction::Init { force: true } })
+            Some(Command::Config { action: ConfigAction::Init { force: true, full: true } })
+        ));
+
+        let minimal =
+            Cli::try_parse_from(["agentbox", "config", "init"]).expect("parse minimal init");
+        assert!(matches!(
+            minimal.command,
+            Some(Command::Config { action: ConfigAction::Init { force: false, full: false } })
         ));
     }
 }

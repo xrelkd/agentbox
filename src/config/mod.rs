@@ -9,8 +9,14 @@ use snafu::{OptionExt, ResultExt};
 
 use crate::error::{self, Result};
 
-/// Default YAML template embedded into the binary for `agentbox config init`.
+/// Minimal YAML template written by `agentbox config init`.
 pub const DEFAULT_CONFIG_TEMPLATE: &[u8] = include_bytes!("default.yaml");
+
+/// Complete YAML template written by `agentbox config init --full`.
+pub const FULL_CONFIG_TEMPLATE: &[u8] = include_bytes!("full.yaml");
+
+/// Container path where the Nix-built AI environment is mounted.
+pub const AI_ENV_MOUNT_PATH: &str = "/run/ai-env";
 
 /// Top-level agentbox configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -23,7 +29,7 @@ pub struct Config {
     /// Nix store/daemon and kernel-module mount settings.
     pub nix: NixConfig,
     /// Host-to-container mount declarations.
-    pub mounts: MountsConfig,
+    pub mounts: Vec<MountEntry>,
     /// Environment variables injected into the container.
     pub environment: EnvironmentConfig,
     /// SOPS secret files injected as environment variables.
@@ -40,8 +46,6 @@ pub struct Config {
 pub struct GeneralConfig {
     /// Host path to the Nix-produced AI environment, resolved through symlinks.
     pub ai_env_path: String,
-    /// Container path where `ai_env_path` is mounted read-only.
-    pub ai_env_mount_path: String,
     /// Prefix used for generated container, home, temp, and metadata names.
     pub container_prefix: String,
     /// Host base directory for home, temporary, and metadata directories.
@@ -126,29 +130,23 @@ pub struct NixConfig {
 /// A single host-to-container mount declaration.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct MountEntry {
     /// Host source path; supports `~` and environment variables.
     pub host: String,
     /// Container destination path; supports `~` and environment variables.
     pub container: String,
-    /// Mount read-only instead of read-write.
+    /// Mount read-only unless explicitly disabled.
+    #[serde(default = "default_read_only")]
     pub read_only: bool,
-    /// Skip the mount when the host path is missing.
-    pub skip_if_missing: bool,
 }
 
-/// Host-to-container mount declarations.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(default)]
-pub struct MountsConfig {
-    /// State directories created on the host and mounted read-write.
-    pub state_dirs: Vec<MountEntry>,
-    /// Tool/config paths mounted read-only when present on the host.
-    pub optional_ro_mounts: Vec<MountEntry>,
-    /// Additional user-defined mounts.
-    pub extra_mounts: Vec<MountEntry>,
+impl Default for MountEntry {
+    fn default() -> Self {
+        Self { host: String::new(), container: String::new(), read_only: default_read_only() }
+    }
 }
+
+const fn default_read_only() -> bool { true }
 
 /// Environment variables injected into the container.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -233,7 +231,7 @@ impl Default for Config {
             general: GeneralConfig::default(),
             container: ContainerConfig::default(),
             nix: NixConfig::default(),
-            mounts: MountsConfig::default(),
+            mounts: default_mounts(),
             environment: EnvironmentConfig::default(),
             secrets: SecretsConfig::default(),
             server: ServerConfig::default(),
@@ -247,7 +245,6 @@ impl Default for Config {
                         AgentServe::new("opencode serve", "opencode attach"),
                     ),
                 ),
-                ("oc-tui".into(), AgentConfig::new("opencode")),
             ]),
         }
     }
@@ -257,13 +254,12 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             ai_env_path: "~/.local/share/agentbox-env".into(),
-            ai_env_mount_path: "/run/ai-env".into(),
             container_prefix: "agentbox".into(),
             runtime_base_dir: "/tmp".into(),
-            forbidden_dirs: vec!["/tmp".into()],
-            shell: "/run/ai-env/bin/zsh".into(),
+            forbidden_dirs: vec!["/".into(), "/tmp".into()],
+            shell: "zsh".into(),
             default_agent: "shell".into(),
-            ocelot_path: "/run/ai-env/bin/ocelot".into(),
+            ocelot_path: "ocelot".into(),
             podman_binary: "podman".into(),
         }
     }
@@ -311,43 +307,32 @@ impl Default for NixConfig {
 }
 
 impl MountEntry {
-    /// Creates a mount entry with explicit flags.
-    pub fn new(
-        host: impl Into<String>,
-        container: impl Into<String>,
-        read_only: bool,
-        skip_if_missing: bool,
-    ) -> Self {
-        Self { host: host.into(), container: container.into(), read_only, skip_if_missing }
+    /// Creates a mount entry with an explicit read-only flag.
+    pub fn new(host: impl Into<String>, container: impl Into<String>, read_only: bool) -> Self {
+        Self { host: host.into(), container: container.into(), read_only }
     }
 }
 
-impl Default for MountsConfig {
-    fn default() -> Self {
-        Self {
-            state_dirs: vec![
-                MountEntry::new("~/.agents", "~/.agents", true, false),
-                MountEntry::new("~/.claude", "~/.claude", true, false),
-                MountEntry::new("~/.claude/projects", "~/.claude/projects", false, false),
-                MountEntry::new("~/.claude/todos", "~/.claude/todos", false, false),
-                MountEntry::new("~/.config/opencode", "~/.config/opencode", true, false),
-                MountEntry::new("~/.local/share/opencode", "~/.local/share/opencode", true, false),
-                MountEntry::new("~/.local/state/opencode", "~/.local/state/opencode", false, false),
-                MountEntry::new("~/.gemini", "~/.gemini", true, false),
-                MountEntry::new("~/.gemini/history", "~/.gemini/history", false, false),
-                MountEntry::new("~/.gemini/tmp", "~/.gemini/tmp", false, false),
-            ],
-            optional_ro_mounts: vec![
-                MountEntry::new("~/.local/bin", "~/.local/bin", true, true),
-                MountEntry::new("~/.config/shell", "~/.config/shell", true, true),
-                MountEntry::new("~/.zshrc", "~/.zshrc", true, true),
-                MountEntry::new("~/.config/zsh", "~/.config/zsh", true, true),
-                MountEntry::new("~/.config/starship.toml", "~/.config/starship.toml", true, true),
-                MountEntry::new("~/.config/starship", "~/.config/starship", true, true),
-            ],
-            extra_mounts: Vec::new(),
-        }
-    }
+fn default_mounts() -> Vec<MountEntry> {
+    vec![
+        MountEntry::new("~/.agents", "~/.agents", true),
+        MountEntry::new("~/.claude", "~/.claude", true),
+        MountEntry::new("~/.claude/projects", "~/.claude/projects", false),
+        MountEntry::new("~/.claude/todos", "~/.claude/todos", false),
+        MountEntry::new("~/.config/opencode", "~/.config/opencode", true),
+        MountEntry::new("~/.local/share/opencode", "~/.local/share/opencode", true),
+        MountEntry::new("~/.local/state/opencode", "~/.local/state/opencode", false),
+        MountEntry::new("~/.gemini", "~/.gemini", true),
+        MountEntry::new("~/.gemini/history", "~/.gemini/history", false),
+        MountEntry::new("~/.gemini/tmp", "~/.gemini/tmp", false),
+        MountEntry::new("~/.local/bin", "~/.local/bin", true),
+        MountEntry::new("~/.config/shell", "~/.config/shell", true),
+        MountEntry::new("~/.zshrc", "~/.zshrc", true),
+        MountEntry::new("~/.config/zsh", "~/.config/zsh", true),
+        MountEntry::new("~/.config/starship.toml", "~/.config/starship.toml", true),
+        MountEntry::new("~/.config/starship", "~/.config/starship", true),
+        MountEntry::new("~/.cargo", "~/.cargo", false),
+    ]
 }
 
 impl Default for EnvironmentConfig {
@@ -443,8 +428,8 @@ impl Config {
         Ok(config)
     }
 
-    /// Writes the built-in YAML template to `path`.
-    pub fn write_default(path: &Path, force: bool) -> Result<()> {
+    /// Writes the minimal or complete built-in YAML template to `path`.
+    pub fn write_default(path: &Path, force: bool, full: bool) -> Result<()> {
         if path.exists() && !force {
             return Err(error::Error::ConfigAlreadyExists { path: path.to_path_buf() });
         }
@@ -456,7 +441,8 @@ impl Config {
                 .with_context(|_| error::CreateDirSnafu { path: parent.to_path_buf() })?;
         }
 
-        fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+        let template = if full { FULL_CONFIG_TEMPLATE } else { DEFAULT_CONFIG_TEMPLATE };
+        fs::write(path, template)
             .with_context(|_| error::WriteConfigSnafu { path: path.to_path_buf() })
     }
 
@@ -574,15 +560,80 @@ pub fn split_command(command: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
-    use super::{Config, DEFAULT_CONFIG_TEMPLATE, expand_path, split_command};
+    use super::{
+        Config, DEFAULT_CONFIG_TEMPLATE, FULL_CONFIG_TEMPLATE, MountEntry, expand_path,
+        split_command,
+    };
 
     #[test]
-    fn default_template_parses_to_default_config() {
+    fn full_template_parses_to_default_config() {
         let parsed: Config =
-            serde_yaml::from_slice(DEFAULT_CONFIG_TEMPLATE).expect("default template should parse");
+            serde_yaml::from_slice(FULL_CONFIG_TEMPLATE).expect("full template should parse");
         assert_eq!(parsed, Config::default());
+    }
+
+    #[test]
+    fn minimal_template_parses_with_fewer_mounts() {
+        let parsed: Config =
+            serde_yaml::from_slice(DEFAULT_CONFIG_TEMPLATE).expect("minimal template should parse");
+        assert!(parsed.mounts.len() < Config::default().mounts.len());
+        assert_eq!(parsed.general, Config::default().general);
+        assert_eq!(parsed.agents, Config::default().agents);
+    }
+
+    #[test]
+    fn write_default_selects_template() {
+        let root =
+            std::env::temp_dir().join(format!("agentbox-template-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&root));
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("config.yaml");
+
+        Config::write_default(&path, false, false).expect("write minimal template");
+        assert_eq!(fs::read(&path).expect("read minimal"), DEFAULT_CONFIG_TEMPLATE.to_vec());
+
+        Config::write_default(&path, true, true).expect("write full template");
+        assert_eq!(fs::read(&path).expect("read full"), FULL_CONFIG_TEMPLATE.to_vec());
+
+        drop(fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn read_only_defaults_to_true() {
+        let config: Config = serde_yaml::from_str(
+            r"
+mounts:
+  - host: /host/path
+    container: /container/path
+",
+        )
+        .expect("mount without read_only should parse");
+        assert!(config.mounts[0].read_only);
+        assert!(MountEntry::default().read_only);
+    }
+
+    #[test]
+    fn mounts_parse_as_a_flat_list() {
+        let config: Config = serde_yaml::from_str(
+            r"
+mounts:
+  - host: /host/path
+    container: /container/path
+    read_only: true
+",
+        )
+        .expect("flat mounts should parse");
+
+        assert_eq!(config.mounts.len(), 1);
+        assert_eq!(config.mounts[0].host, "/host/path");
+        assert_eq!(config.mounts[0].container, "/container/path");
+        assert!(config.mounts[0].read_only);
+        assert!(Config::default().general.forbidden_dirs.contains(&"/".into()));
     }
 
     #[test]
@@ -597,7 +648,7 @@ general:
         assert_eq!(config.server.serve_port, 5000);
         assert_eq!(config.general.container_prefix, "custom");
         assert_eq!(config.general.ai_env_path, Config::default().general.ai_env_path);
-        assert_eq!(config.agents.len(), 4);
+        assert_eq!(config.agents.len(), 3);
         assert_eq!(config.general.default_agent, "shell");
         assert_eq!(
             config.agents["opencode"].serve.as_ref().expect("opencode serve").command,

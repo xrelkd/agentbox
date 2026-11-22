@@ -1,0 +1,208 @@
+# Agentbox complete configuration template.
+#
+# Written by `agentbox config init --full`.
+# Default locations:
+#   $XDG_CONFIG_HOME/agentbox/config.yaml
+#   ~/.config/agentbox/config.yaml
+#
+# Omitted fields keep the values shown below. Paths support `~` and `$ENV`
+# expansion. Use `agentbox config path` to see the file agentbox will load, and
+# `agentbox --config PATH <command>` to load a different file.
+
+# General runtime paths and process settings.
+general:
+  # Nix-built AI environment mounted into the container.
+  ai_env_path: "~/.local/share/agentbox-env"
+  # Prefix for generated container, home, temporary, and metadata names.
+  container_prefix: "agentbox"
+  # Host base directory used for home, temporary, and metadata directories.
+  runtime_base_dir: "/tmp"
+  # Project directory prefixes that agentbox refuses to run from. The root
+  # directory is always rejected, regardless of this list.
+  forbidden_dirs: ["/", "/tmp"]
+  # Shell name, searched under <ai_env_path>/bin; falls back to bash if missing.
+  shell: "zsh"
+  # Agent used when no command is given. `shell` opens an interactive shell.
+  default_agent: "shell"
+  # Supervisor name, searched under <ai_env_path>/bin. When absent from the AI
+  # environment, agentbox falls back to `podman run --init`.
+  ocelot_path: "ocelot"
+  # Podman executable used for all container operations.
+  podman_binary: "podman"
+
+# Container isolation, resources, and root filesystem settings.
+container:
+  # Prefix for the generated container hostname.
+  hostname_prefix: "sandbox"
+  # Working directory inside the container.
+  workdir: "/workspace"
+  # Mount the container root filesystem read-only.
+  read_only: true
+  # Prevent child processes from gaining new privileges.
+  no_new_privileges: true
+  # Drop every Linux capability.
+  drop_all_caps: true
+  # Maximum number of processes allowed in the container.
+  pids_limit: 1024
+  # Container memory limit passed to Podman.
+  memory_limit: "12g"
+  # Container memory-plus-swap limit; null lets Podman pick its default.
+  memory_swap: null
+  # Container CPU quota; null disables the limit.
+  cpus: "2"
+  # Additional container ulimits.
+  ulimits:
+    core: "0"
+    nofile: "4096:8192"
+  # Inherit host proxy environment variables into the container.
+  inherit_proxy: false
+  # Size of the /tmp tmpfs.
+  tmp_size: "2g"
+  # Size of the /var/tmp tmpfs.
+  var_tmp_size: "2g"
+  # Mount the generated root filesystem as an overlay.
+  rootfs_overlay: true
+
+# Nix store, daemon, and kernel-module mount settings.
+nix:
+  # Mount the Nix daemon socket, profiles, and /etc/nix when the socket exists.
+  enable_daemon_mount: true
+  # Host Nix store path, mounted read-only into the container.
+  store_path: "/nix/store"
+  # Host directory containing the Nix daemon socket.
+  daemon_socket_dir: "/nix/var/nix/daemon-socket"
+  # Host Nix profiles directory.
+  profiles_dir: "/nix/var/nix/profiles"
+  # Host /etc/nix directory.
+  etc_nix_dir: "/etc/nix"
+  # Mount matching host kernel modules when available.
+  mount_kernel_modules: false
+  # Host directory containing kernel module version directories.
+  kernel_modules_dir: "/run/current-system/kernel-modules/lib/modules"
+  # Container directory where kernel modules are mounted.
+  kernel_modules_mount_dir: "/lib/modules"
+  # Nix configuration directory copied into the per-project home and mounted
+  # read-only; the real host directory is never exposed to the container.
+  host_config_dir: "~/.config/nix"
+  # Host Nix cache directory created before the container starts.
+  host_cache_dir: "~/.cache/nix"
+
+# Host-to-container mount declarations.
+# The per-project persistent home is mounted first at $HOME; entries below are
+# mounted on top of it. Mounts are read-only unless `read_only: false` is set.
+# Missing host paths are skipped with a warning. Parent directories must come
+# before their writable children. `agentbox stop` keeps the persistent home
+# unless --purge-home is given.
+mounts:
+  - host: "~/.agents"
+    container: "~/.agents"
+    read_only: true
+  - host: "~/.claude"
+    container: "~/.claude"
+    read_only: true
+  - host: "~/.claude/projects"
+    container: "~/.claude/projects"
+    read_only: false
+  - host: "~/.claude/todos"
+    container: "~/.claude/todos"
+    read_only: false
+  - host: "~/.config/opencode"
+    container: "~/.config/opencode"
+    read_only: false
+  - host: "~/.local/share/opencode"
+    container: "~/.local/share/opencode"
+    read_only: false
+  - host: "~/.local/state/opencode"
+    container: "~/.local/state/opencode"
+    read_only: false
+  - host: "~/.gemini"
+    container: "~/.gemini"
+    read_only: true
+  - host: "~/.gemini/history"
+    container: "~/.gemini/history"
+    read_only: false
+  - host: "~/.gemini/tmp"
+    container: "~/.gemini/tmp"
+    read_only: false
+  - host: "~/.local/bin"
+    container: "~/.local/bin"
+    read_only: true
+  - host: "~/.config/shell"
+    container: "~/.config/shell"
+    read_only: true
+  - host: "~/.zshrc"
+    container: "~/.zshrc"
+    read_only: true
+  - host: "~/.config/zsh"
+    container: "~/.config/zsh"
+    read_only: true
+  - host: "~/.config/starship.toml"
+    container: "~/.config/starship.toml"
+    read_only: true
+  - host: "~/.config/starship"
+    container: "~/.config/starship"
+    read_only: true
+  - host: "~/.cargo"
+    container: "~/.cargo"
+    read_only: false
+
+# Environment variables injected into the container.
+environment:
+  # Container PATH.
+  path: "~/.local/bin:/run/ai-env/bin:/usr/bin:/bin"
+  # Container SSL_CERT_FILE and NIX_SSL_CERT_FILE.
+  ssl_cert_file: "/run/ai-env/etc/ssl/certs/ca-bundle.crt"
+  # Container CPATH.
+  cpath: "/run/ai-env/include"
+  # Container LIBRARY_PATH.
+  library_path: "/run/ai-env/lib"
+  # Container PKG_CONFIG_PATH.
+  pkg_config_path: "/run/ai-env/lib/pkgconfig:/run/ai-env/share/pkgconfig"
+  # Container LANG and LC_ALL.
+  lang: "C.UTF-8"
+  # Container HISTFILE, stored in the persistent home directory.
+  histfile: "~/.cache/zsh_history"
+  # TERM used when the host does not provide one.
+  default_term: "xterm-256color"
+  # Container NIX_REMOTE.
+  nix_remote: "daemon"
+  # Additional environment variables as name/string pairs.
+  extra_env: {}
+
+# SOPS secret files injected as environment variables.
+secrets:
+  # Host base directory containing SOPS secret files.
+  base_dir: "~/.config/sops-nix/secrets"
+  # Environment variable name -> secret path relative to base_dir.
+  entries:
+    ANTHROPIC_API_KEY: "ai/anthropic-api-key/default"
+    GEMINI_API_KEY: "ai/gemini-api-key/default"
+    OPENROUTER_API_KEY: "ai/openrouter-api-key/sandbox"
+
+# Generic server startup and readiness polling settings.
+# The old keys `opencode_port` and `opencode_host` are still accepted.
+server:
+  # Port passed to an agent `serve` command and used by its attach client.
+  serve_port: 4096
+  # Host used by readiness probes inside the container.
+  serve_host: "127.0.0.1"
+  # Address the server listens on inside the container. No host port is
+  # published; the server is only reachable from within the container.
+  listen_host: "127.0.0.1"
+  # Maximum wait time for a server, in seconds.
+  startup_timeout_secs: 15
+  # Delay between readiness probes, in milliseconds.
+  poll_interval_ms: 250
+
+# Agent commands. Claude and Gemini resume their native provider session.
+# Add a `serve` block to any agent that exposes a client/server mode.
+agents:
+  opencode:
+    command: "opencode"
+    serve:
+      command: "opencode serve"
+      attach: "opencode attach"
+  claude:
+    command: "claude --resume"
+  gemini:
+    command: "gemini --resume"
