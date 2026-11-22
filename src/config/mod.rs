@@ -9,115 +9,8 @@ use snafu::ResultExt;
 
 use crate::error::{self, Result};
 
-/// Default YAML template emitted by `agentbox config init`.
-pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"
-general:
-  ai_env_path: "~/.local/share/agentbox-env"
-  ai_env_mount_path: "/run/ai-env"
-  container_prefix: "agentbox"
-  runtime_base_dir: "/tmp"
-  forbidden_dirs: ["/", "/tmp"]
-  shell: "/run/ai-env/bin/zsh"
-  podman_binary: "podman"
-
-container:
-  hostname_prefix: "sandbox"
-  workdir: "/workspace"
-  read_only: true
-  no_new_privileges: true
-  drop_all_caps: true
-  pids_limit: 1024
-  memory_limit: "12g"
-  var_tmp_size: "2g"
-  cache_tmpfs_size: "2g"
-  rootfs_overlay: true
-
-nix:
-  enable_daemon_mount: true
-  store_path: "/nix/store"
-  daemon_socket_dir: "/nix/var/nix/daemon-socket"
-  profiles_dir: "/nix/var/nix/profiles"
-  etc_nix_dir: "/etc/nix"
-  mount_kernel_modules: true
-  kernel_modules_dir: "/run/current-system/kernel-modules/lib/modules"
-  kernel_modules_mount_dir: "/lib/modules"
-  host_config_dir: "~/.config/nix"
-  host_cache_dir: "~/.cache/nix"
-
-mounts:
-  state_dirs:
-    - host: "~/.agents"
-      container: "~/.agents"
-    - host: "~/.config/opencode"
-      container: "~/.config/opencode"
-    - host: "~/.local/share/opencode"
-      container: "~/.local/share/opencode"
-    - host: "~/.local/state/opencode"
-      container: "~/.local/state/opencode"
-    - host: "~/.claude"
-      container: "~/.claude"
-    - host: "~/.gemini"
-      container: "~/.gemini"
-  optional_ro_mounts:
-    - host: "~/.local/bin"
-      container: "~/.local/bin"
-      read_only: true
-      skip_if_missing: true
-    - host: "~/.zshrc"
-      container: "~/.zshrc"
-      read_only: true
-      skip_if_missing: true
-    - host: "~/.config/zsh"
-      container: "~/.config/zsh"
-      read_only: true
-      skip_if_missing: true
-    - host: "~/.config/starship.toml"
-      container: "~/.config/starship.toml"
-      read_only: true
-      skip_if_missing: true
-    - host: "~/.config/starship"
-      container: "~/.config/starship"
-      read_only: true
-      skip_if_missing: true
-  extra_mounts: []
-
-environment:
-  path: "~/.local/bin:/run/ai-env/bin:/usr/bin:/bin"
-  ssl_cert_file: "/run/ai-env/etc/ssl/certs/ca-bundle.crt"
-  cpath: "/run/ai-env/include"
-  library_path: "/run/ai-env/lib"
-  pkg_config_path: "/run/ai-env/lib/pkgconfig:/run/ai-env/share/pkgconfig"
-  lang: "C.UTF-8"
-  histfile: "~/.cache/zsh_history"
-  default_term: "xterm-256color"
-  nix_remote: "daemon"
-  extra_env: {}
-
-secrets:
-  base_dir: "~/.config/sops-nix/secrets"
-  entries:
-    ANTHROPIC_API_KEY: "ai/anthropic-api-key/default"
-    GEMINI_API_KEY: "ai/gemini-api-key/default"
-    OPENROUTER_API_KEY: "ai/openrouter-api-key/sandbox"
-
-server:
-  default_tmux_session: "main"
-  opencode_port: 4096
-  opencode_host: "127.0.0.1"
-  startup_timeout_secs: 15
-  poll_interval_ms: 250
-
-agents:
-  oc-tui:
-    command: "opencode"
-    default_session: "opencode"
-  claude:
-    command: "claude"
-    default_session: "claude"
-  gemini:
-    command: "gemini"
-    default_session: "gemini"
-"#;
+/// Default YAML template embedded into the binary for `agentbox config init`.
+pub const DEFAULT_CONFIG_TEMPLATE: &[u8] = include_bytes!("default.yaml");
 
 /// Top-level agentbox configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -506,7 +399,7 @@ impl Config {
                 .with_context(|_| error::CreateDirSnafu { path: parent.to_path_buf() })?;
         }
 
-        fs::write(path, DEFAULT_CONFIG_TEMPLATE.trim_start())
+        fs::write(path, DEFAULT_CONFIG_TEMPLATE)
             .with_context(|_| error::WriteConfigSnafu { path: path.to_path_buf() })
     }
 
@@ -572,7 +465,7 @@ mod tests {
     #[test]
     fn default_template_parses_to_default_config() {
         let parsed: Config =
-            serde_yaml::from_str(DEFAULT_CONFIG_TEMPLATE).expect("default template should parse");
+            serde_yaml::from_slice(DEFAULT_CONFIG_TEMPLATE).expect("default template should parse");
         assert_eq!(parsed, Config::default());
     }
 

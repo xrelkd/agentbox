@@ -395,15 +395,18 @@ impl App {
         )
     }
 
+    #[inline]
     fn init_shell(&self) -> String {
         let mount = self.config.general.ai_env_mount_path.trim_end_matches('/');
         format!("{mount}/bin/bash")
     }
 
+    #[inline]
     fn expand_config_path(&self, raw: &str) -> PathBuf {
         config::expand_path(Path::new(raw), &self.home)
     }
 
+    #[inline]
     fn expand_config_value(&self, raw: &str) -> String { config::expand_str(raw, &self.home) }
 }
 

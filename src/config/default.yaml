@@ -1,0 +1,172 @@
+# Agentbox default configuration.
+#
+# Generated with `agentbox config init`.
+# Default locations:
+#   $XDG_CONFIG_HOME/agentbox/config.yaml
+#   ~/.config/agentbox/config.yaml
+#
+# Omitted fields keep the values shown below. Paths support `~` and `$ENV`
+# expansion. Use `agentbox config path` to see the file agentbox will load, and
+# `agentbox --config PATH <command>` to load a different file.
+
+# General runtime paths and process settings.
+general:
+  # Nix-built AI environment mounted into the container.
+  ai_env_path: "~/.local/share/agentbox-env"
+  # Mount point for ai_env_path inside the container.
+  ai_env_mount_path: "/run/ai-env"
+  # Prefix for generated container, temporary, and metadata names.
+  container_prefix: "agentbox"
+  # Host base directory used for temporary and metadata directories.
+  runtime_base_dir: "/tmp"
+  # Project directories that agentbox refuses to run from.
+  forbidden_dirs: ["/", "/tmp"]
+  # Preferred shell inside the container; falls back to bash if unavailable.
+  shell: "/run/ai-env/bin/zsh"
+  # Podman executable used for all container operations.
+  podman_binary: "podman"
+
+# Container isolation, resources, and root filesystem settings.
+container:
+  # Prefix for the generated container hostname.
+  hostname_prefix: "sandbox"
+  # Working directory inside the container.
+  workdir: "/workspace"
+  # Mount the container root filesystem read-only.
+  read_only: true
+  # Prevent child processes from gaining new privileges.
+  no_new_privileges: true
+  # Drop every Linux capability.
+  drop_all_caps: true
+  # Maximum number of processes allowed in the container.
+  pids_limit: 1024
+  # Container memory limit passed to Podman.
+  memory_limit: "12g"
+  # Size of the /var/tmp tmpfs.
+  var_tmp_size: "2g"
+  # Size of the $HOME/.cache tmpfs.
+  cache_tmpfs_size: "2g"
+  # Mount the generated root filesystem as an overlay.
+  rootfs_overlay: true
+
+# Nix store, daemon, and kernel-module mount settings.
+nix:
+  # Mount the Nix daemon socket, profiles, and /etc/nix when the socket exists.
+  enable_daemon_mount: true
+  # Host Nix store path, mounted read-only into the container.
+  store_path: "/nix/store"
+  # Host directory containing the Nix daemon socket.
+  daemon_socket_dir: "/nix/var/nix/daemon-socket"
+  # Host Nix profiles directory.
+  profiles_dir: "/nix/var/nix/profiles"
+  # Host /etc/nix directory.
+  etc_nix_dir: "/etc/nix"
+  # Mount matching host kernel modules when available.
+  mount_kernel_modules: true
+  # Host directory containing kernel module version directories.
+  kernel_modules_dir: "/run/current-system/kernel-modules/lib/modules"
+  # Container directory where kernel modules are mounted.
+  kernel_modules_mount_dir: "/lib/modules"
+  # Host Nix configuration directory created and mounted read-only.
+  host_config_dir: "~/.config/nix"
+  # Host Nix cache directory created before the container starts.
+  host_cache_dir: "~/.cache/nix"
+
+# Host-to-container mount declarations.
+mounts:
+  # State directories created on the host and mounted read-write.
+  state_dirs:
+    - host: "~/.agents"
+      container: "~/.agents"
+    - host: "~/.config/opencode"
+      container: "~/.config/opencode"
+    - host: "~/.local/share/opencode"
+      container: "~/.local/share/opencode"
+    - host: "~/.local/state/opencode"
+      container: "~/.local/state/opencode"
+    - host: "~/.claude"
+      container: "~/.claude"
+    - host: "~/.gemini"
+      container: "~/.gemini"
+  # Tool/config paths mounted read-only when present on the host.
+  optional_ro_mounts:
+    - host: "~/.local/bin"
+      container: "~/.local/bin"
+      read_only: true
+      skip_if_missing: true
+    - host: "~/.zshrc"
+      container: "~/.zshrc"
+      read_only: true
+      skip_if_missing: true
+    - host: "~/.config/zsh"
+      container: "~/.config/zsh"
+      read_only: true
+      skip_if_missing: true
+    - host: "~/.config/starship.toml"
+      container: "~/.config/starship.toml"
+      read_only: true
+      skip_if_missing: true
+    - host: "~/.config/starship"
+      container: "~/.config/starship"
+      read_only: true
+      skip_if_missing: true
+  # Additional user-defined mounts; use the same fields as the lists above.
+  extra_mounts: []
+
+# Environment variables injected into the container.
+environment:
+  # Container PATH.
+  path: "~/.local/bin:/run/ai-env/bin:/usr/bin:/bin"
+  # Container SSL_CERT_FILE and NIX_SSL_CERT_FILE.
+  ssl_cert_file: "/run/ai-env/etc/ssl/certs/ca-bundle.crt"
+  # Container CPATH.
+  cpath: "/run/ai-env/include"
+  # Container LIBRARY_PATH.
+  library_path: "/run/ai-env/lib"
+  # Container PKG_CONFIG_PATH.
+  pkg_config_path: "/run/ai-env/lib/pkgconfig:/run/ai-env/share/pkgconfig"
+  # Container LANG and LC_ALL.
+  lang: "C.UTF-8"
+  # Container HISTFILE.
+  histfile: "~/.cache/zsh_history"
+  # TERM used when the host does not provide one.
+  default_term: "xterm-256color"
+  # Container NIX_REMOTE.
+  nix_remote: "daemon"
+  # Additional environment variables as name/string pairs.
+  extra_env: {}
+
+# SOPS secret files injected as environment variables.
+secrets:
+  # Host base directory containing SOPS secret files.
+  base_dir: "~/.config/sops-nix/secrets"
+  # Environment variable name -> secret path relative to base_dir.
+  entries:
+    ANTHROPIC_API_KEY: "ai/anthropic-api-key/default"
+    GEMINI_API_KEY: "ai/gemini-api-key/default"
+    OPENROUTER_API_KEY: "ai/openrouter-api-key/sandbox"
+
+# OpenCode server startup and readiness polling settings.
+server:
+  # tmux session created when the container starts.
+  default_tmux_session: "main"
+  # Port used by `opencode serve`.
+  opencode_port: 4096
+  # Host used by `opencode serve` and `opencode attach`.
+  opencode_host: "127.0.0.1"
+  # Maximum wait time for the OpenCode server, in seconds.
+  startup_timeout_secs: 15
+  # Delay between readiness probes, in milliseconds.
+  poll_interval_ms: 250
+
+# Agent commands and their default tmux session names.
+agents:
+  oc-tui:
+    command: "opencode"
+    default_session: "opencode"
+  claude:
+    command: "claude"
+    default_session: "claude"
+  gemini:
+    command: "gemini"
+    default_session: "gemini"
