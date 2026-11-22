@@ -1,0 +1,694 @@
+use std::{
+    ffi::OsString,
+    fmt,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    thread,
+    time::{Duration, Instant},
+};
+
+use snafu::ResultExt;
+
+use crate::error::{self, Result};
+
+/// Host-to-container bind mount.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mount {
+    /// Host source path.
+    pub host: PathBuf,
+    /// Container destination path.
+    pub container: PathBuf,
+    /// Whether the mount is read-only.
+    pub read_only: bool,
+}
+
+impl Mount {
+    /// Creates a bind mount.
+    pub const fn new(host: PathBuf, container: PathBuf, read_only: bool) -> Self {
+        Self { host, container, read_only }
+    }
+
+    fn to_arg(&self) -> OsString {
+        format!(
+            "{}:{}:{}",
+            self.host.display(),
+            self.container.display(),
+            if self.read_only { "ro" } else { "rw" }
+        )
+        .into()
+    }
+}
+
+/// Container tmpfs declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Tmpfs {
+    /// Container mount point.
+    pub target: PathBuf,
+    /// Podman tmpfs options.
+    pub options: String,
+}
+
+impl Tmpfs {
+    /// Creates a tmpfs declaration.
+    pub fn new(target: PathBuf, options: impl Into<String>) -> Self {
+        Self { target, options: options.into() }
+    }
+
+    fn to_arg(&self) -> OsString { format!("{}:{}", self.target.display(), self.options).into() }
+}
+
+/// Parsed container state from `podman inspect`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContainerStatus {
+    /// Container was created but never started.
+    Created,
+    /// Container is currently running.
+    Running,
+    /// Container is paused.
+    Paused,
+    /// Container exited.
+    Exited,
+    /// Container is stopped.
+    Stopped,
+    /// Container is being removed.
+    Removing,
+    /// Unrecognized Podman state.
+    Other(String),
+}
+
+impl ContainerStatus {
+    /// Returns true only for the running state.
+    pub fn is_running(&self) -> bool { *self == Self::Running }
+}
+
+impl fmt::Display for ContainerStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created => formatter.write_str("created"),
+            Self::Running => formatter.write_str("running"),
+            Self::Paused => formatter.write_str("paused"),
+            Self::Exited => formatter.write_str("exited"),
+            Self::Stopped => formatter.write_str("stopped"),
+            Self::Removing => formatter.write_str("removing"),
+            Self::Other(value) => formatter.write_str(value),
+        }
+    }
+}
+
+impl From<&str> for ContainerStatus {
+    fn from(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "created" => Self::Created,
+            "running" => Self::Running,
+            "paused" => Self::Paused,
+            "exited" => Self::Exited,
+            "stopped" => Self::Stopped,
+            "removing" => Self::Removing,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+/// Brief container entry from `podman ps`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerInfo {
+    /// Container name.
+    pub name: String,
+    /// Raw status text from Podman.
+    pub status: String,
+}
+
+/// Type-safe description of a `podman run` invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(clippy::struct_excessive_bools, reason = "container flags map directly to Podman options")]
+pub struct ContainerSpec {
+    name: String,
+    hostname: String,
+    workdir: PathBuf,
+    uid: u32,
+    gid: u32,
+    rootfs: PathBuf,
+    rootfs_overlay: bool,
+    init_shell: String,
+    init_script: String,
+    read_only: bool,
+    no_new_privileges: bool,
+    drop_all_caps: bool,
+    pids_limit: Option<u32>,
+    memory_limit: Option<String>,
+    mounts: Vec<Mount>,
+    tmpfs: Vec<Tmpfs>,
+    env: Vec<(String, String)>,
+}
+
+/// Builds a [`ContainerSpec`] without exposing raw Podman arguments.
+#[derive(Clone, Debug)]
+#[expect(clippy::struct_excessive_bools, reason = "builder mirrors the explicit Podman option set")]
+pub struct ContainerSpecBuilder {
+    name: Option<String>,
+    hostname: Option<String>,
+    workdir: Option<PathBuf>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    rootfs: Option<PathBuf>,
+    rootfs_overlay: bool,
+    init_shell: Option<String>,
+    init_script: Option<String>,
+    read_only: bool,
+    no_new_privileges: bool,
+    drop_all_caps: bool,
+    pids_limit: Option<u32>,
+    memory_limit: Option<String>,
+    mounts: Vec<Mount>,
+    tmpfs: Vec<Tmpfs>,
+    env: Vec<(String, String)>,
+}
+
+/// Readiness probe executed inside the container.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TcpProbe {
+    /// Shell used for the `/dev/tcp` probe.
+    pub shell: String,
+    /// Target host.
+    pub host: String,
+    /// Target port.
+    pub port: u16,
+    /// Maximum total wait time.
+    pub timeout: Duration,
+    /// Delay between probes.
+    pub interval: Duration,
+}
+
+impl TcpProbe {
+    fn script(&self) -> String {
+        format!("exec 3<>/dev/tcp/{}/{}", shell_quote(&self.host), self.port)
+    }
+}
+
+/// Thin wrapper around every Podman invocation used by agentbox.
+#[derive(Clone, Debug)]
+pub struct PodmanClient {
+    binary: String,
+}
+
+impl PodmanClient {
+    /// Creates a client for the configured Podman executable.
+    pub fn new(binary: impl Into<String>) -> Self { Self { binary: binary.into() } }
+
+    /// Returns true when a container with the given name exists.
+    pub fn container_exists(&self, name: &str) -> Result<bool> {
+        let args = os_args(&["container", "exists", name]);
+        let output = self.run(&args, true)?;
+        Ok(output.status.success())
+    }
+
+    /// Returns the current state of a container.
+    pub fn container_status(&self, name: &str) -> Result<ContainerStatus> {
+        let args = os_args(&["inspect", "-f", "{{.State.Status}}", name]);
+        let output = self.run(&args, false)?;
+        let status = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        snafu::ensure!(
+            !status.is_empty(),
+            error::ParsePodmanOutputSnafu { output: "empty container status" }
+        );
+        Ok(ContainerStatus::from(status.as_str()))
+    }
+
+    /// Starts a detached container from a validated specification.
+    pub fn run_detached(&self, spec: &ContainerSpec) -> Result<()> {
+        let args = spec.build_args();
+        tracing::debug!("Starting container with: {}", ContainerSpec::redacted_args(&args));
+        let _ = self.run(&args, false)?;
+        Ok(())
+    }
+
+    /// Executes a command inside a container and waits for completion.
+    pub fn exec(&self, name: &str, command: &[&str], workdir: Option<&Path>) -> Result<()> {
+        let args = Self::exec_args(name, command, workdir, false);
+        let output = self.run(&args, true)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(command_failure("podman exec", &output))
+    }
+
+    /// Executes a command inside a container and returns its stdout.
+    pub fn exec_capture(
+        &self,
+        name: &str,
+        command: &[&str],
+        workdir: Option<&Path>,
+    ) -> Result<String> {
+        let args = Self::exec_args(name, command, workdir, false);
+        let output = self.run(&args, true)?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        Err(command_failure("podman exec", &output))
+    }
+
+    /// Replaces the current process with an interactive `podman exec`.
+    pub fn exec_interactive(
+        &self,
+        name: &str,
+        command: &[&str],
+        workdir: Option<&Path>,
+    ) -> Result<()> {
+        let args = Self::exec_args(name, command, workdir, true);
+        tracing::debug!("Attaching with: podman {}", os_args_to_string(&args));
+        let error = Command::new(&self.binary).args(args).exec();
+        Err(error::Error::ExecReplace { source: error })
+    }
+
+    /// Stops and removes a container, tolerating a missing or already stopped
+    /// container.
+    pub fn stop_and_remove(&self, name: &str) -> Result<()> {
+        for action in ["stop", "rm -f"] {
+            let mut parts = action.split_whitespace();
+            let command = parts.next().unwrap_or("");
+            let mut args = vec![OsString::from(command)];
+            if command == "rm" {
+                args.push(OsString::from("-f"));
+            }
+            args.push(OsString::from(name));
+            let output = self.run(&args, true)?;
+            if !output.status.success() {
+                tracing::warn!(
+                    "podman {action} {name} returned {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists agentbox containers.
+    pub fn list_containers(&self, prefix: &str) -> Result<Vec<ContainerInfo>> {
+        let format = "{{.Names}}\t{{.Status}}";
+        let filter = format!("name=^{prefix}-");
+        let args = os_args(&["ps", "-a", "--filter", &filter, "--format", format]);
+        let output = self.run(&args, false)?;
+        Ok(output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let line = String::from_utf8_lossy(line);
+                let (name, status) = line.split_once('\t')?;
+                Some(ContainerInfo {
+                    name: name.trim().to_owned(),
+                    status: status.trim().to_owned(),
+                })
+            })
+            .collect())
+    }
+
+    /// Returns combined container logs, tolerating a missing container.
+    pub fn logs(&self, name: &str) -> Result<String> {
+        let args = os_args(&["logs", name]);
+        let output = self.run(&args, true)?;
+        let mut logs = String::from_utf8_lossy(&output.stdout).into_owned();
+        logs.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(logs)
+    }
+
+    /// Polls a TCP port from inside the container until it is ready.
+    pub fn wait_for_tcp_ready(&self, name: &str, probe: &TcpProbe) -> Result<()> {
+        let started = Instant::now();
+        let script = probe.script();
+        let command = [probe.shell.as_str(), "-c", script.as_str()];
+
+        loop {
+            let status = self.container_status(name)?;
+            if !status.is_running() {
+                return Err(error::Error::ContainerExited {
+                    name: name.to_owned(),
+                    status: status.to_string(),
+                    logs: self.logs(name).unwrap_or_default(),
+                });
+            }
+
+            let probe_output = self.run(&Self::exec_args(name, &command, None, false), true)?;
+            if probe_output.status.success() {
+                return Ok(());
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= probe.timeout {
+                return Err(error::Error::StartupTimeout {
+                    name: name.to_owned(),
+                    seconds: probe.timeout.as_secs(),
+                    logs: self.logs(name).unwrap_or_default(),
+                });
+            }
+            thread::sleep(probe.interval.min(probe.timeout.saturating_sub(elapsed)));
+        }
+    }
+
+    fn exec_args(name: &str, command: &[&str], workdir: Option<&Path>, tty: bool) -> Vec<OsString> {
+        let mut args = vec![OsString::from("exec")];
+        if tty {
+            args.push(OsString::from("-it"));
+        }
+        if let Some(directory) = workdir {
+            args.push(OsString::from("-w"));
+            args.push(directory.as_os_str().to_os_string());
+        }
+        args.push(OsString::from(name));
+        args.extend(command.iter().map(OsString::from));
+        args
+    }
+
+    fn run(&self, args: &[OsString], allow_failure: bool) -> Result<Output> {
+        tracing::debug!("Running podman {}", os_args_to_string(args));
+        let output = Command::new(&self.binary)
+            .args(args)
+            .output()
+            .with_context(|_| error::SpawnCommandSnafu { program: self.binary.clone() })?;
+        if !allow_failure && !output.status.success() {
+            return Err(command_failure(&self.binary, &output));
+        }
+        Ok(output)
+    }
+}
+
+impl ContainerSpec {
+    /// Starts building a container specification.
+    pub fn builder(name: impl Into<String>) -> ContainerSpecBuilder {
+        ContainerSpecBuilder::new(name)
+    }
+
+    fn build_args(&self) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("run"),
+            OsString::from("-d"),
+            OsString::from("--name"),
+            OsString::from(&self.name),
+            OsString::from("--hostname"),
+            OsString::from(&self.hostname),
+            OsString::from("--workdir"),
+            self.workdir.as_os_str().to_os_string(),
+            OsString::from("--userns=keep-id"),
+            OsString::from("--user"),
+            OsString::from(format!("{}:{}", self.uid, self.gid)),
+        ];
+
+        if self.read_only {
+            args.push(OsString::from("--read-only"));
+        }
+        if self.no_new_privileges {
+            args.push(OsString::from("--security-opt=no-new-privileges"));
+        }
+        if self.drop_all_caps {
+            args.push(OsString::from("--cap-drop=ALL"));
+        }
+        if let Some(limit) = self.pids_limit {
+            args.push(OsString::from(format!("--pids-limit={limit}")));
+        }
+        if let Some(limit) = &self.memory_limit {
+            args.push(OsString::from(format!("--memory={limit}")));
+        }
+        for mount in &self.mounts {
+            args.push(OsString::from("-v"));
+            args.push(mount.to_arg());
+        }
+        for tmpfs in &self.tmpfs {
+            args.push(OsString::from("--tmpfs"));
+            args.push(tmpfs.to_arg());
+        }
+        for (key, value) in &self.env {
+            args.push(OsString::from("-e"));
+            args.push(OsString::from(format!("{key}={value}")));
+        }
+
+        let rootfs = if self.rootfs_overlay {
+            format!("{}:O", self.rootfs.display())
+        } else {
+            self.rootfs.display().to_string()
+        };
+        args.push(OsString::from("--rootfs"));
+        args.push(rootfs.into());
+        args.push(OsString::from(&self.init_shell));
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(&self.init_script));
+        args
+    }
+
+    fn redacted_args(args: &[OsString]) -> String {
+        let mut redact = false;
+        args.iter()
+            .map(|argument| {
+                let text = argument.to_string_lossy();
+                if redact {
+                    redact = false;
+                    return "<redacted>".to_owned();
+                }
+                let owned = text.into_owned();
+                if owned == "-e" {
+                    redact = true;
+                }
+                owned
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+impl ContainerSpecBuilder {
+    /// Creates an empty builder for the named container.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            hostname: None,
+            workdir: None,
+            uid: None,
+            gid: None,
+            rootfs: None,
+            rootfs_overlay: true,
+            init_shell: None,
+            init_script: None,
+            read_only: false,
+            no_new_privileges: false,
+            drop_all_caps: false,
+            pids_limit: None,
+            memory_limit: None,
+            mounts: Vec::new(),
+            tmpfs: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Sets the container hostname.
+    pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
+        self
+    }
+
+    /// Sets the container work directory.
+    pub fn workdir(mut self, workdir: impl Into<PathBuf>) -> Self {
+        self.workdir = Some(workdir.into());
+        self
+    }
+
+    /// Sets the numeric user and group IDs.
+    pub const fn user(mut self, uid: u32, gid: u32) -> Self {
+        self.uid = Some(uid);
+        self.gid = Some(gid);
+        self
+    }
+
+    /// Sets the generated rootfs path.
+    pub fn rootfs(mut self, rootfs: impl Into<PathBuf>) -> Self {
+        self.rootfs = Some(rootfs.into());
+        self
+    }
+
+    /// Controls whether the rootfs is mounted as an overlay.
+    pub const fn rootfs_overlay(mut self, enabled: bool) -> Self {
+        self.rootfs_overlay = enabled;
+        self
+    }
+
+    /// Sets the shell used by the container init script.
+    pub fn init_shell(mut self, shell: impl Into<String>) -> Self {
+        self.init_shell = Some(shell.into());
+        self
+    }
+
+    /// Sets the container init script.
+    pub fn init_script(mut self, script: impl Into<String>) -> Self {
+        self.init_script = Some(script.into());
+        self
+    }
+
+    /// Enables or disables a read-only root filesystem.
+    pub const fn read_only(mut self, enabled: bool) -> Self {
+        self.read_only = enabled;
+        self
+    }
+
+    /// Enables or disables the no-new-privileges security option.
+    pub const fn no_new_privileges(mut self, enabled: bool) -> Self {
+        self.no_new_privileges = enabled;
+        self
+    }
+
+    /// Enables or disables dropping all Linux capabilities.
+    pub const fn drop_all_caps(mut self, enabled: bool) -> Self {
+        self.drop_all_caps = enabled;
+        self
+    }
+
+    /// Sets the container process limit.
+    pub const fn pids_limit(mut self, limit: u32) -> Self {
+        self.pids_limit = Some(limit);
+        self
+    }
+
+    /// Sets the container memory limit.
+    pub fn memory_limit(mut self, limit: impl Into<String>) -> Self {
+        self.memory_limit = Some(limit.into());
+        self
+    }
+
+    /// Adds a bind mount, replacing any previous mount with the same container
+    /// path.
+    pub fn mount(mut self, mount: Mount) -> Self {
+        self.mounts.retain(|existing| existing.container != mount.container);
+        self.mounts.push(mount);
+        self
+    }
+
+    /// Adds a tmpfs declaration.
+    pub fn tmpfs(mut self, tmpfs: Tmpfs) -> Self {
+        self.tmpfs.push(tmpfs);
+        self
+    }
+
+    /// Adds an environment variable.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Validates required fields and produces a [`ContainerSpec`].
+    pub fn build(self) -> Result<ContainerSpec> {
+        let missing = |field| error::Error::MissingField { field };
+        Ok(ContainerSpec {
+            name: self.name.ok_or_else(|| missing("name"))?,
+            hostname: self.hostname.ok_or_else(|| missing("hostname"))?,
+            workdir: self.workdir.ok_or_else(|| missing("workdir"))?,
+            uid: self.uid.ok_or_else(|| missing("uid"))?,
+            gid: self.gid.ok_or_else(|| missing("gid"))?,
+            rootfs: self.rootfs.ok_or_else(|| missing("rootfs"))?,
+            rootfs_overlay: self.rootfs_overlay,
+            init_shell: self.init_shell.ok_or_else(|| missing("init_shell"))?,
+            init_script: self.init_script.ok_or_else(|| missing("init_script"))?,
+            read_only: self.read_only,
+            no_new_privileges: self.no_new_privileges,
+            drop_all_caps: self.drop_all_caps,
+            pids_limit: self.pids_limit,
+            memory_limit: self.memory_limit,
+            mounts: self.mounts,
+            tmpfs: self.tmpfs,
+            env: self.env,
+        })
+    }
+}
+
+/// Quotes a value for safe use in a POSIX shell command.
+#[inline]
+pub fn shell_quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
+
+#[inline]
+fn os_args(arguments: &[&str]) -> Vec<OsString> { arguments.iter().map(OsString::from).collect() }
+
+#[inline]
+fn os_args_to_string(arguments: &[OsString]) -> String {
+    arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>().join(" ")
+}
+
+#[inline]
+fn command_failure(program: &str, output: &Output) -> error::Error {
+    error::Error::CommandFailed {
+        program: program.to_owned(),
+        status: output.status,
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{ContainerSpec, ContainerStatus, Mount, TcpProbe, shell_quote};
+    use crate::error::Error;
+
+    fn minimal_spec() -> ContainerSpec {
+        ContainerSpec::builder("agentbox-test")
+            .hostname("sandbox-test")
+            .workdir(PathBuf::from("/workspace"))
+            .user(1000, 1000)
+            .rootfs(PathBuf::from("/tmp/rootfs"))
+            .init_shell("/run/ai-env/bin/bash")
+            .init_script("exec opencode serve")
+            .read_only(true)
+            .no_new_privileges(true)
+            .drop_all_caps(true)
+            .pids_limit(1024)
+            .memory_limit("12g")
+            .mount(Mount::new(PathBuf::from("/tmp/host"), PathBuf::from("/tmp"), false))
+            .env("OPENROUTER_API_KEY", "super-secret")
+            .build()
+            .expect("spec should build")
+    }
+
+    #[test]
+    fn builder_generates_expected_podman_args() {
+        let spec = minimal_spec();
+        let args = spec.build_args();
+        let strings = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+
+        assert!(strings.contains(&"--read-only".into()));
+        assert!(strings.contains(&"--security-opt=no-new-privileges".into()));
+        assert!(strings.contains(&"--cap-drop=ALL".into()));
+        assert!(strings.contains(&"--pids-limit=1024".into()));
+        assert!(strings.contains(&"--memory=12g".into()));
+        assert!(strings.contains(&"/tmp/host:/tmp:rw".into()));
+        assert!(strings.contains(&"--rootfs".into()));
+        assert!(strings.contains(&"/tmp/rootfs:O".into()));
+        assert!(strings.contains(&"OPENROUTER_API_KEY=super-secret".into()));
+    }
+
+    #[test]
+    fn redacted_args_hide_environment_values() {
+        let spec = minimal_spec();
+        let args = spec.build_args();
+        let redacted = ContainerSpec::redacted_args(&args);
+        assert!(redacted.contains("<redacted>"));
+        assert!(!redacted.contains("super-secret"));
+    }
+
+    #[test]
+    fn builder_reports_missing_fields() {
+        let result = ContainerSpec::builder("incomplete").build();
+        assert!(matches!(result, Err(Error::MissingField { field: "hostname" })));
+    }
+
+    #[test]
+    fn status_and_shell_quote_are_stable() {
+        assert_eq!(ContainerStatus::from(" running\n"), ContainerStatus::Running);
+        assert!(!ContainerStatus::Exited.is_running());
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+
+        let probe = TcpProbe {
+            shell: "/bin/sh".into(),
+            host: "127.0.0.1".into(),
+            port: 4096,
+            timeout: std::time::Duration::from_secs(15),
+            interval: std::time::Duration::from_millis(250),
+        };
+        assert_eq!(probe.script(), "exec 3<>/dev/tcp/'127.0.0.1'/4096");
+    }
+}
