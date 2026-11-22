@@ -5,6 +5,7 @@ mod error;
 mod ocelot;
 mod podman;
 mod rootfs;
+mod ui;
 mod workspace;
 
 use std::{env, process::ExitCode};

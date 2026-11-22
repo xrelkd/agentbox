@@ -51,6 +51,9 @@ pub enum Error {
     #[snafu(display("Could not serialize output: {source}"))]
     SerializeOutput { source: serde_json::Error },
 
+    #[snafu(display("Could not write to stdout: {source}"))]
+    WriteStdout { source: std::io::Error },
+
     #[snafu(display("Could not create directory `{}`: {source}", path.display()))]
     CreateDir { path: PathBuf, source: std::io::Error },
 
@@ -80,6 +83,12 @@ pub enum Error {
 
     #[snafu(display("Agent `{name}` is not defined in the configuration"))]
     UnknownAgent { name: String },
+
+    #[snafu(display("Could not build the interactive picker: {message}"))]
+    BuildFuzzyFinder { message: String },
+
+    #[snafu(display("Could not run the interactive picker: {message}"))]
+    RunFuzzyFinder { message: String },
 
     #[snafu(display("Agent `{name}` has no server command configured"))]
     AgentHasNoServe { name: String },

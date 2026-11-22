@@ -1,12 +1,12 @@
-use std::{env, path::PathBuf};
+use std::{env, io::Write, path::PathBuf};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use snafu::OptionExt;
+use snafu::{OptionExt, ResultExt};
 
 use crate::{
     app::App,
-    config::Config,
+    config::{Config, DEFAULT_CONFIG_TEMPLATE, FULL_CONFIG_TEMPLATE},
     error::{self, Result},
     workspace::ProjectIdentity,
 };
@@ -46,6 +46,7 @@ pub enum OutputFormat {
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     /// Start the project container; other commands only attach to it.
+    #[command(aliases = ["s", "up"])]
     Start {
         /// Attach to the selected agent after starting.
         #[arg(long)]
@@ -57,6 +58,7 @@ pub enum Command {
     },
 
     /// Stop the project container and clean temporary directories.
+    #[command(aliases = ["x", "down"])]
     Stop {
         /// Also remove the persistent home directory.
         #[arg(long)]
@@ -64,7 +66,7 @@ pub enum Command {
     },
 
     /// List agentbox-managed containers and the current project directory.
-    #[command(aliases = ["ps", "ls"])]
+    #[command(aliases = ["ps", "ls", "l"])]
     List {
         /// Emit JSON instead of a table.
         #[arg(long, value_enum)]
@@ -76,7 +78,7 @@ pub enum Command {
     },
 
     /// Show identity and paths for the current project directory.
-    #[command(aliases = ["info", "project"])]
+    #[command(aliases = ["info", "project", "i", "st"])]
     Status {
         /// Emit JSON instead of a key/value report.
         #[arg(long, value_enum)]
@@ -88,12 +90,14 @@ pub enum Command {
     },
 
     /// Attach to a shell session in the running container.
+    #[command(alias = "sh")]
     Shell,
 
     /// Attach to a configured agent in the running container.
+    #[command(alias = "a")]
     Agent {
-        /// Configured agent name.
-        name: String,
+        /// Configured agent name; defaults to `general.default_agent`.
+        name: Option<String>,
     },
 
     /// Attach to the `OpenCode` server in the running container (alias: `oc`).
@@ -101,9 +105,11 @@ pub enum Command {
     Opencode,
 
     /// Attach to a Claude session in the running container.
+    #[command(alias = "c")]
     Claude,
 
     /// Attach to a Gemini session in the running container.
+    #[command(alias = "g")]
     Gemini,
 
     /// Print the host temporary directory for this project.
@@ -143,6 +149,13 @@ pub enum ConfigAction {
 
     /// Print the resolved configuration file path.
     Path,
+
+    /// Print a built-in YAML template without writing a file.
+    Show {
+        /// Print the complete template instead of the minimal default.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 impl Cli {
@@ -172,6 +185,11 @@ impl Cli {
                         println!("{}", config_path.display());
                         Ok(())
                     }
+                    ConfigAction::Show { full } => {
+                        let template =
+                            if *full { FULL_CONFIG_TEMPLATE } else { DEFAULT_CONFIG_TEMPLATE };
+                        std::io::stdout().write_all(template).context(error::WriteStdoutSnafu)
+                    }
                 };
             }
             _ => {}
@@ -191,7 +209,7 @@ impl Cli {
             Command::Status { format, quiet } => {
                 app.print_status(format.unwrap_or_default(), quiet)
             }
-            Command::Agent { name } => app.launch_agent(&name),
+            Command::Agent { name } => app.launch_agent_named(name.as_deref()),
             Command::Opencode => app.launch_agent("opencode"),
             Command::Claude => app.launch_agent("claude"),
             Command::Gemini => app.launch_agent("gemini"),
@@ -245,16 +263,53 @@ mod tests {
 
         let agent =
             Cli::try_parse_from(["agentbox", "agent", "gemini"]).expect("parse generic agent");
-        assert!(matches!(agent.command, Some(Command::Agent { name }) if name == "gemini"));
+        assert!(
+            matches!(agent.command, Some(Command::Agent { name: Some(name) }) if name == "gemini")
+        );
+
+        let default_agent =
+            Cli::try_parse_from(["agentbox", "agent"]).expect("parse default agent");
+        assert!(matches!(default_agent.command, Some(Command::Agent { name: None })));
     }
 
     #[test]
     fn parses_subcommand_aliases() {
-        let oc = Cli::try_parse_from(["agentbox", "oc"]).expect("parse oc");
-        assert!(matches!(oc.command, Some(Command::Opencode)));
+        for alias in ["s", "up"] {
+            let cli = Cli::try_parse_from(["agentbox", alias]).expect("parse start alias");
+            assert!(matches!(cli.command, Some(Command::Start { .. })));
+        }
 
-        let list = Cli::try_parse_from(["agentbox", "ls"]).expect("parse ls");
-        assert!(matches!(list.command, Some(Command::List { .. })));
+        for alias in ["x", "down"] {
+            let cli = Cli::try_parse_from(["agentbox", alias]).expect("parse stop alias");
+            assert!(matches!(cli.command, Some(Command::Stop { .. })));
+        }
+
+        for alias in ["ps", "ls", "l"] {
+            let cli = Cli::try_parse_from(["agentbox", alias]).expect("parse list alias");
+            assert!(matches!(cli.command, Some(Command::List { .. })));
+        }
+
+        for alias in ["info", "project", "i", "st"] {
+            let cli = Cli::try_parse_from(["agentbox", alias]).expect("parse status alias");
+            assert!(matches!(cli.command, Some(Command::Status { .. })));
+        }
+
+        let shell = Cli::try_parse_from(["agentbox", "sh"]).expect("parse shell alias");
+        assert!(matches!(shell.command, Some(Command::Shell)));
+
+        let agent = Cli::try_parse_from(["agentbox", "a", "claude"]).expect("parse agent alias");
+        assert!(
+            matches!(agent.command, Some(Command::Agent { name: Some(name) }) if name == "claude")
+        );
+
+        let opencode = Cli::try_parse_from(["agentbox", "oc"]).expect("parse opencode alias");
+        assert!(matches!(opencode.command, Some(Command::Opencode)));
+
+        let claude = Cli::try_parse_from(["agentbox", "c"]).expect("parse claude alias");
+        assert!(matches!(claude.command, Some(Command::Claude)));
+
+        let gemini = Cli::try_parse_from(["agentbox", "g"]).expect("parse gemini alias");
+        assert!(matches!(gemini.command, Some(Command::Gemini)));
     }
 
     #[test]
@@ -343,6 +398,22 @@ mod tests {
         assert!(matches!(
             minimal.command,
             Some(Command::Config { action: ConfigAction::Init { force: false, full: false } })
+        ));
+    }
+
+    #[test]
+    fn parses_config_show() {
+        let show = Cli::try_parse_from(["agentbox", "config", "show"]).expect("parse config show");
+        assert!(matches!(
+            show.command,
+            Some(Command::Config { action: ConfigAction::Show { full: false } })
+        ));
+
+        let full = Cli::try_parse_from(["agentbox", "config", "show", "--full"])
+            .expect("parse full config show");
+        assert!(matches!(
+            full.command,
+            Some(Command::Config { action: ConfigAction::Show { full: true } })
         ));
     }
 }

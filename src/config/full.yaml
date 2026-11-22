@@ -108,10 +108,10 @@ mounts:
     read_only: false
   - host: "~/.config/opencode"
     container: "~/.config/opencode"
-    read_only: false
+    read_only: true
   - host: "~/.local/share/opencode"
     container: "~/.local/share/opencode"
-    read_only: false
+    read_only: true
   - host: "~/.local/state/opencode"
     container: "~/.local/state/opencode"
     read_only: false
