@@ -101,6 +101,10 @@ mounts:
       container: "~/.local/bin"
       read_only: true
       skip_if_missing: true
+    - host: "~/.config/shell"
+      container: "~/.config/shell"
+      read_only: true
+      skip_if_missing: true
     - host: "~/.zshrc"
       container: "~/.zshrc"
       read_only: true
@@ -160,8 +164,14 @@ server:
   default_tmux_session: "main"
   # Port passed to an agent `serve` command and used by its attach client.
   serve_port: 4096
-  # Host passed to an agent `serve` command and used by its attach client.
+  # Host used by readiness probes inside the container.
   serve_host: "127.0.0.1"
+  # Address the server listens on inside the container. Must not be loopback
+  # when publish_port is enabled, or the host mapping cannot reach it.
+  listen_host: "0.0.0.0"
+  # Publish serve_port on a random host loopback port only; never expose it to
+  # networks outside the host.
+  publish_port: true
   # Maximum wait time for a server, in seconds.
   startup_timeout_secs: 15
   # Delay between readiness probes, in milliseconds.

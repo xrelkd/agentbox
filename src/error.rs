@@ -82,6 +82,11 @@ pub enum Error {
     SessionsUnavailable,
 
     #[snafu(display(
+        "Container `{name}` is not running (status: {status}); run `agentbox start` first"
+    ))]
+    ContainerNotRunning { name: String, status: String },
+
+    #[snafu(display(
         r"Container `{name}` exited unexpectedly (status: {status}); logs follow:
 {logs}"
     ))]
@@ -96,6 +101,6 @@ pub enum Error {
     #[snafu(display("Could not parse Podman output `{output}`"))]
     ParsePodmanOutput { output: String },
 
-    #[snafu(display("Could not replace the current process with Podman: {source}"))]
-    ExecReplace { source: std::io::Error },
+    #[snafu(display("Could not replace the current process with `{program}`: {source}"))]
+    ExecReplace { program: String, source: std::io::Error },
 }

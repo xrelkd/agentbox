@@ -198,9 +198,14 @@ pub struct ServerConfig {
     /// Port used by an agent `serve` command.
     #[serde(alias = "opencode_port")]
     pub serve_port: u16,
-    /// Host used by an agent `serve` command and its attach client.
+    /// Host used by readiness probes inside the container.
     #[serde(alias = "opencode_host")]
     pub serve_host: String,
+    /// Address the server listens on inside the container.
+    pub listen_host: String,
+    /// Publish `serve_port` on a random host loopback port, never on external
+    /// networks.
+    pub publish_port: bool,
     /// Maximum wait time for a server to become ready.
     pub startup_timeout_secs: u64,
     /// Delay between readiness probes.
@@ -214,7 +219,8 @@ pub struct ServerConfig {
 pub struct AgentServe {
     /// Command that starts the server, e.g. `opencode serve`.
     pub command: String,
-    /// Command that attaches to the server, e.g. `opencode attach`.
+    /// Command run inside the container with the attach URL appended, e.g.
+    /// `opencode attach`.
     pub attach: String,
 }
 
@@ -333,6 +339,7 @@ impl Default for MountsConfig {
             ],
             optional_ro_mounts: vec![
                 MountEntry::new("~/.local/bin", "~/.local/bin", true, true),
+                MountEntry::new("~/.config/shell", "~/.config/shell", true, true),
                 MountEntry::new("~/.zshrc", "~/.zshrc", true, true),
                 MountEntry::new("~/.config/zsh", "~/.config/zsh", true, true),
                 MountEntry::new("~/.config/starship.toml", "~/.config/starship.toml", true, true),
@@ -379,6 +386,8 @@ impl Default for ServerConfig {
             default_tmux_session: "main".into(),
             serve_port: 4096,
             serve_host: "127.0.0.1".into(),
+            listen_host: "0.0.0.0".into(),
+            publish_port: true,
             startup_timeout_secs: 15,
             poll_interval_ms: 250,
         }
@@ -493,6 +502,19 @@ impl Config {
             error::InvalidConfigSnafu { message: "container.workdir must be an absolute path" }
         );
         snafu::ensure!(
+            !self.server.listen_host.is_empty(),
+            error::InvalidConfigSnafu { message: "server.listen_host must not be empty" }
+        );
+        let loopback_listen =
+            matches!(self.server.listen_host.as_str(), "127.0.0.1" | "::1" | "localhost");
+        snafu::ensure!(
+            !self.server.publish_port || !loopback_listen,
+            error::InvalidConfigSnafu {
+                message: "server.listen_host must not be loopback when server.publish_port is \
+                          enabled"
+            }
+        );
+        snafu::ensure!(
             self.server.serve_port > 0,
             error::InvalidConfigSnafu { message: "server.serve_port must be greater than zero" }
         );
@@ -519,11 +541,6 @@ impl Config {
             }
         }
         Ok(())
-    }
-
-    /// Returns the URL passed to an agent's attach command.
-    pub fn serve_url(&self) -> String {
-        format!("http://{}:{}", self.server.serve_host, self.server.serve_port)
     }
 }
 
@@ -596,9 +613,10 @@ general:
         .expect("new keys should parse");
         assert_eq!(config.server.serve_port, 6000);
         assert_eq!(config.server.serve_host, "0.0.0.0");
+        assert_eq!(config.server.listen_host, "0.0.0.0");
+        assert!(config.server.publish_port);
         assert_eq!(config.general.default_agent, "gemini");
         assert_eq!(config.general.session_backend, SessionBackend::Tmux);
-        assert_eq!(config.serve_url(), "http://0.0.0.0:6000");
     }
 
     #[test]
@@ -625,6 +643,27 @@ general:
         let mut config = Config::default();
         config.container.workdir = "workspace".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_listen_host() {
+        let mut config = Config::default();
+        config.server.listen_host.clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_loopback_listen_host_when_publishing() {
+        let mut config = Config::default();
+        config.server.listen_host = "127.0.0.1".into();
+        assert!(config.validate().is_err());
+
+        config.server.listen_host = "::1".into();
+        assert!(config.validate().is_err());
+
+        config.server.publish_port = false;
+        config.server.listen_host = "127.0.0.1".into();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

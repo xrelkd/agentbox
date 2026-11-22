@@ -100,11 +100,12 @@ pub fn render_config(config: &Config) -> Result<String> {
 
     let program = arguments.remove(0);
     let host = config.server.serve_host.clone();
+    let listen_host = config.server.listen_host.clone();
     let port = config.server.serve_port;
     arguments.push("--port".into());
     arguments.push(port.to_string());
     arguments.push("--hostname".into());
-    arguments.push(host.clone());
+    arguments.push(listen_host);
 
     let keeper = ProcessConfig {
         program: config.general.ocelot_path.clone(),

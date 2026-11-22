@@ -27,7 +27,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH", env = "AGENTBOX_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Subcommand to run; defaults to `general.default_agent`.
+    /// Subcommand to run; defaults to `start` (detached container).
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -35,7 +35,7 @@ pub struct Cli {
 /// Supported agentbox subcommands.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
-    /// Start the project container, optionally attaching to an agent.
+    /// Start the project container; other commands only attach to it.
     Start {
         /// Attach to the selected agent after starting.
         #[arg(long)]
@@ -49,53 +49,6 @@ pub enum Command {
         session: Option<String>,
     },
 
-    /// Start or attach a session for any configured agent by name.
-    Agent {
-        /// Configured agent name.
-        name: String,
-
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
-
-    /// Attach to the `OpenCode` server (alias for `agent opencode`).
-    #[command(alias = "oc")]
-    Opencode,
-
-    /// Start or attach an `OpenCode` TUI agent session.
-    OcTui {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
-
-    /// Start or attach a Claude agent session.
-    Claude {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
-
-    /// Start or attach a Gemini agent session.
-    Gemini {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
-
-    /// Attach to a plain shell session.
-    #[command(alias = "tmux")]
-    Shell {
-        /// Optional session name for multiplexed backends.
-        session: Option<String>,
-    },
-
-    /// List tmux sessions inside the project container.
-    Sessions,
-
-    /// Print the host temporary directory for this project.
-    Tmp,
-
-    /// Print the persistent home directory for this project.
-    Home,
-
     /// Stop the project container and clean temporary directories.
     Stop {
         /// Also remove the persistent home directory.
@@ -106,6 +59,53 @@ pub enum Command {
     /// List agentbox-managed containers.
     #[command(aliases = ["ps", "ls"])]
     List,
+
+    /// Attach to a shell session in the running container.
+    #[command(alias = "tmux")]
+    Shell {
+        /// Optional session name for multiplexed backends.
+        session: Option<String>,
+    },
+
+    /// Attach to a session for any configured agent in the running container.
+    Agent {
+        /// Configured agent name.
+        name: String,
+
+        /// Optional session name for multiplexed backends.
+        session: Option<String>,
+    },
+
+    /// Attach to the `OpenCode` server in the running container (alias: `oc`).
+    #[command(alias = "oc")]
+    Opencode,
+
+    /// Attach to an `OpenCode` TUI session in the running container.
+    OcTui {
+        /// Optional session name for multiplexed backends.
+        session: Option<String>,
+    },
+
+    /// Attach to a Claude session in the running container.
+    Claude {
+        /// Optional session name for multiplexed backends.
+        session: Option<String>,
+    },
+
+    /// Attach to a Gemini session in the running container.
+    Gemini {
+        /// Optional session name for multiplexed backends.
+        session: Option<String>,
+    },
+
+    /// List tmux sessions inside the running project container.
+    Sessions,
+
+    /// Print the host temporary directory for this project.
+    Tmp,
+
+    /// Print the persistent home directory for this project.
+    Home,
 
     /// Generate shell completions for agentbox.
     Completions {
@@ -136,20 +136,9 @@ pub enum ConfigAction {
 }
 
 impl Cli {
-    /// Returns the command implied by the configuration when none was given.
-    pub fn command_or_default(&self, config: &Config) -> Command {
-        if let Some(command) = &self.command {
-            return command.clone();
-        }
-        let name = config.general.default_agent.as_str();
-        if name == "shell" {
-            return Command::Shell { session: None };
-        }
-        let has_server = config.agents.get(name).is_some_and(|agent| agent.serve.is_some());
-        if has_server {
-            return Command::Start { attach: true, agent: Some(name.to_owned()), session: None };
-        }
-        Command::Agent { name: name.to_owned(), session: None }
+    /// Returns the selected command, defaulting to a detached container start.
+    pub fn command_or_default(&self) -> Command {
+        self.command.clone().unwrap_or(Command::Start { attach: false, agent: None, session: None })
     }
 
     /// Executes the selected command.
@@ -177,7 +166,7 @@ impl Cli {
         }
 
         let config = Config::load(&config_path)?;
-        let command = self.command_or_default(&config);
+        let command = self.command_or_default();
         let identity = ProjectIdentity::resolve(&home, &config)?;
         let app = App::new(config, identity, home);
 
@@ -185,23 +174,23 @@ impl Cli {
             Command::Start { attach, agent, session } => {
                 app.start(agent.as_deref(), session, attach)
             }
-            Command::Agent { name, session } => app.launch(&name, session),
-            Command::Opencode => app.opencode(),
-            Command::OcTui { session } => app.agent("oc-tui", session),
-            Command::Claude { session } => app.agent("claude", session),
-            Command::Gemini { session } => app.agent("gemini", session),
-            Command::Shell { session } => app.shell(session),
-            Command::Sessions => app.sessions(),
+            Command::Agent { name, session } => app.launch_agent(&name, session),
+            Command::Opencode => app.launch_agent("opencode", None),
+            Command::OcTui { session } => app.launch_agent("oc-tui", session),
+            Command::Claude { session } => app.launch_agent("claude", session),
+            Command::Gemini { session } => app.launch_agent("gemini", session),
+            Command::Shell { session } => app.attach_shell(session),
+            Command::Sessions => app.list_sessions(),
             Command::Tmp => {
-                app.temporary_dir();
+                app.print_temporary_dir();
                 Ok(())
             }
             Command::Home => {
-                app.home_dir();
+                app.print_home_dir();
                 Ok(())
             }
-            Command::Stop { purge_home } => app.stop(purge_home),
-            Command::List => app.list(),
+            Command::Stop { purge_home } => app.stop_project(purge_home),
+            Command::List => app.list_containers(),
             Command::Completions { .. } | Command::Config { .. } => Ok(()),
         }
     }
@@ -214,26 +203,24 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{Cli, Command, ConfigAction};
-    use crate::config::Config;
 
     #[test]
-    fn defaults_to_configured_shell() {
+    fn defaults_to_detached_start() {
         let cli = Cli::try_parse_from(["agentbox"]).expect("parse empty args");
         assert!(matches!(
-            cli.command_or_default(&Config::default()),
-            Command::Shell { session: None }
+            cli.command_or_default(),
+            Command::Start { attach: false, agent: None, session: None }
         ));
         assert_eq!(cli.verbose, 0);
     }
 
     #[test]
-    fn defaults_to_configured_agent_server() {
-        let mut config = Config::default();
-        config.general.default_agent = "opencode".into();
-        let cli = Cli::try_parse_from(["agentbox"]).expect("parse empty args");
+    fn default_ignores_configured_agent() {
+        let cli = Cli::try_parse_from(["agentbox", "--config", "/tmp/agentbox.yaml"])
+            .expect("parse config option");
         assert!(matches!(
-            cli.command_or_default(&config),
-            Command::Start { attach: true, agent: Some(name), session: None } if name == "opencode"
+            cli.command_or_default(),
+            Command::Start { attach: false, agent: None, session: None }
         ));
     }
 

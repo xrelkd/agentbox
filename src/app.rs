@@ -12,13 +12,16 @@ use crate::{
     config::{self, AgentServe, Config, SessionBackend},
     error::{self, Result},
     ocelot,
-    podman::{ContainerSpec, Mount, PodmanClient, TcpProbe, Tmpfs, shell_quote},
+    podman::{
+        ContainerSpec, ContainerStatus, Mount, PodmanClient, Publish, TcpProbe, Tmpfs, shell_quote,
+    },
     rootfs,
     workspace::ProjectIdentity,
 };
 
 const OCELOT_CONFIG_PATH: &str = "/etc/agentbox/ocelot.yaml";
 const SERVE_MARKER_PREFIX: &str = "/var/tmp/agentbox-serve-";
+const CONTAINER_LOOPBACK: &str = "localhost";
 
 /// Init strategy selected for a container.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +37,7 @@ enum InitMode {
 struct Runtime {
     mode: InitMode,
     shell: String,
+    probe_shell: String,
 }
 
 /// Orchestrates project setup and every agentbox subcommand.
@@ -56,28 +60,29 @@ impl App {
     }
 
     /// Prints the host temporary directory for the current project.
-    pub fn temporary_dir(&self) {
+    pub fn print_temporary_dir(&self) {
         println!("{}", self.identity.tmp_dir.display());
     }
 
     /// Prints the host directory mounted as the persistent container home.
-    pub fn home_dir(&self) {
+    pub fn print_home_dir(&self) {
         println!("{}", self.identity.home_dir.display());
     }
 
     /// Lists agentbox-managed containers.
-    pub fn list(&self) -> Result<()> {
+    pub fn list_containers(&self) -> Result<()> {
         let prefix = &self.config.general.container_prefix;
         let containers = self.podman.list_containers(prefix)?;
-        println!("{:<48}\tSTATUS", "NAME");
+        println!("{:<48}\t{:<12}\tPORTS", "NAME", "STATUS");
         for container in containers {
-            println!("{:<48}\t{}", container.name, container.status);
+            let ports = if container.ports.is_empty() { "-" } else { &container.ports };
+            println!("{:<48}\t{:<12}\t{ports}", container.name, container.status);
         }
         Ok(())
     }
 
     /// Stops the project container and removes its transient directories.
-    pub fn stop(&self, purge_home: bool) -> Result<()> {
+    pub fn stop_project(&self, purge_home: bool) -> Result<()> {
         let name = &self.identity.container_name;
         if self.podman.container_exists(name)? {
             tracing::info!("Stopping and removing container: {name}");
@@ -100,71 +105,69 @@ impl App {
         Ok(())
     }
 
-    /// Starts the container without attaching, optionally attaching afterwards.
+    /// Starts the container, optionally attaching to an agent afterwards.
     pub fn start(&self, agent: Option<&str>, session: Option<String>, attach: bool) -> Result<()> {
-        drop(self.start_container()?);
+        let runtime = self.start_container()?;
+        if runtime.mode == InitMode::Fallback
+            && let Some(name) = self.startup_serve_agent(agent)
+        {
+            let serve = self
+                .config
+                .agents
+                .get(&name)
+                .and_then(|configured| configured.serve.clone())
+                .with_context(|| error::AgentHasNoServeSnafu { name: name.clone() })?;
+            self.ensure_fallback_serve(&name, &serve)?;
+        }
         if !attach {
             return Ok(());
         }
         match agent.unwrap_or(self.config.general.default_agent.as_str()) {
-            "shell" => self.shell(session),
-            name => self.launch(name, session),
+            "shell" => self.attach_shell(session),
+            name => self.launch_agent(name, session),
         }
     }
 
-    /// Launches an agent by name, using its server when one is configured.
-    pub fn launch(&self, agent_name: &str, session: Option<String>) -> Result<()> {
+    /// Attaches to an agent by name, using its server when one is configured.
+    pub fn launch_agent(&self, agent_name: &str, session: Option<String>) -> Result<()> {
         let has_serve =
             self.config.agents.get(agent_name).and_then(|agent| agent.serve.as_ref()).is_some();
-        if has_serve { self.serve(agent_name) } else { self.agent(agent_name, session) }
-    }
-
-    /// Attaches to the `OpenCode` server managed by the container init.
-    pub fn opencode(&self) -> Result<()> { self.serve("opencode") }
-
-    /// Attaches to a configured agent server.
-    pub fn serve(&self, agent_name: &str) -> Result<()> {
-        let agent = self
-            .config
-            .agents
-            .get(agent_name)
-            .with_context(|| error::UnknownAgentSnafu { name: agent_name.to_owned() })?;
-        let serve = agent
-            .serve
-            .clone()
-            .with_context(|| error::AgentHasNoServeSnafu { name: agent_name.to_owned() })?;
-        let runtime = self.start_container()?;
-        let name = &self.identity.container_name;
-        if runtime.mode == InitMode::Fallback {
-            self.ensure_fallback_serve(agent_name, &serve)?;
+        if has_serve {
+            self.attach_server(agent_name)
+        } else {
+            self.attach_agent(agent_name, session)
         }
-
-        let probe = TcpProbe {
-            shell: runtime.shell,
-            host: self.config.server.serve_host.clone(),
-            port: self.config.server.serve_port,
-            timeout: Duration::from_secs(self.config.server.startup_timeout_secs),
-            interval: Duration::from_millis(self.config.server.poll_interval_ms),
-        };
-        tracing::info!("Waiting for {agent_name} server in {name} to be ready...");
-        self.podman.wait_for_tcp_ready(name, &probe)?;
-
-        let mut arguments = config::split_command(&serve.attach);
-        arguments.push(self.config.serve_url());
-        let command = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-        tracing::info!("Attaching to the {agent_name} server...");
-        let workdir = self.expand_config_path(&self.config.container.workdir);
-        self.podman.exec_interactive(name, &command, Some(&workdir))
     }
 
-    /// Creates or attaches to an interactive agent session.
-    pub fn agent(&self, agent_name: &str, session: Option<String>) -> Result<()> {
+    /// Attaches to a configured agent server from inside the container.
+    pub fn attach_server(&self, agent_name: &str) -> Result<()> {
+        let serve = self
+            .config
+            .agents
+            .get(agent_name)
+            .with_context(|| error::UnknownAgentSnafu { name: agent_name.to_owned() })?
+            .serve
+            .as_ref()
+            .with_context(|| error::AgentHasNoServeSnafu { name: agent_name.to_owned() })?;
+        let runtime = self.require_running_container()?;
+        self.wait_for_server(agent_name, &runtime)?;
+
+        let command = self.build_attach_command(agent_name, serve)?;
+        let arguments = command.iter().map(String::as_str).collect::<Vec<_>>();
+        let workdir = self.expand_config_path(&self.config.container.workdir);
+
+        tracing::info!("Attaching to the {agent_name} server from inside the container...");
+        self.podman.exec_interactive(&self.identity.container_name, &arguments, Some(&workdir))
+    }
+
+    /// Attaches to an interactive agent session in the running container.
+    pub fn attach_agent(&self, agent_name: &str, session: Option<String>) -> Result<()> {
         let agent = self
             .config
             .agents
             .get(agent_name)
             .with_context(|| error::UnknownAgentSnafu { name: agent_name.to_owned() })?;
-        drop(self.start_container()?);
+        drop(self.require_running_container()?);
         let name = &self.identity.container_name;
         let workdir = self.expand_config_path(&self.config.container.workdir);
 
@@ -184,8 +187,8 @@ impl App {
     }
 
     /// Attaches to a plain interactive shell.
-    pub fn shell(&self, session: Option<String>) -> Result<()> {
-        let runtime = self.start_container()?;
+    pub fn attach_shell(&self, session: Option<String>) -> Result<()> {
+        let runtime = self.require_running_container()?;
         let name = &self.identity.container_name;
         let workdir = self.expand_config_path(&self.config.container.workdir);
 
@@ -204,11 +207,11 @@ impl App {
     }
 
     /// Lists tmux sessions inside the project container.
-    pub fn sessions(&self) -> Result<()> {
+    pub fn list_sessions(&self) -> Result<()> {
         if self.config.general.session_backend != SessionBackend::Tmux {
             return Err(error::Error::SessionsUnavailable);
         }
-        drop(self.start_container()?);
+        drop(self.require_running_container()?);
         let output = self.podman.exec_capture(
             &self.identity.container_name,
             &["tmux", "list-sessions"],
@@ -251,12 +254,47 @@ impl App {
         Ok(())
     }
 
+    fn wait_for_server(&self, agent_name: &str, runtime: &Runtime) -> Result<()> {
+        let name = &self.identity.container_name;
+        let probe = TcpProbe {
+            shell: runtime.probe_shell.clone(),
+            host: self.config.server.serve_host.clone(),
+            port: self.config.server.serve_port,
+            timeout: Duration::from_secs(self.config.server.startup_timeout_secs),
+            interval: Duration::from_millis(self.config.server.poll_interval_ms),
+        };
+        tracing::info!("Waiting for {agent_name} server in {name} to be ready...");
+        self.podman.wait_for_tcp_ready(name, &probe)
+    }
+
+    fn require_running_container(&self) -> Result<Runtime> {
+        let name = &self.identity.container_name;
+        snafu::ensure!(
+            self.podman.container_exists(name)?,
+            error::ContainerNotRunningSnafu { name: name.clone(), status: "missing".to_owned() }
+        );
+        let status = self.podman.container_status(name)?;
+        snafu::ensure!(
+            status == ContainerStatus::Running,
+            error::ContainerNotRunningSnafu { name: name.clone(), status: status.to_string() }
+        );
+        Ok(self.runtime())
+    }
+
+    fn startup_serve_agent(&self, requested: Option<&str>) -> Option<String> {
+        [requested, Some(self.config.general.default_agent.as_str()), Some("opencode")]
+            .into_iter()
+            .flatten()
+            .find(|name| self.config.agents.get(*name).is_some_and(|agent| agent.serve.is_some()))
+            .map(str::to_owned)
+    }
+
     fn start_container(&self) -> Result<Runtime> {
         let name = &self.identity.container_name;
         let runtime = self.runtime();
         if self.podman.container_exists(name)? {
             match self.podman.container_status(name)? {
-                crate::podman::ContainerStatus::Running => {
+                ContainerStatus::Running => {
                     tracing::debug!("Container {name} is already running");
                     return Ok(runtime);
                 }
@@ -288,11 +326,23 @@ impl App {
     }
 
     fn runtime(&self) -> Runtime {
-        let mode = if self.ocelot_available() { InitMode::Ocelot } else { InitMode::Fallback };
-        Runtime { mode, shell: self.shell.clone() }
+        let mode = if self.is_ocelot_available() { InitMode::Ocelot } else { InitMode::Fallback };
+        Runtime { mode, shell: self.shell.clone(), probe_shell: self.init_shell() }
     }
 
-    fn ocelot_available(&self) -> bool {
+    fn build_attach_command(&self, agent_name: &str, serve: &AgentServe) -> Result<Vec<String>> {
+        let mut command = config::split_command(&serve.attach);
+        snafu::ensure!(
+            !command.is_empty(),
+            error::InvalidConfigSnafu {
+                message: format!("agents.{agent_name}.serve.attach must not be empty")
+            }
+        );
+        command.push(format!("http://{CONTAINER_LOOPBACK}:{}", self.config.server.serve_port));
+        Ok(command)
+    }
+
+    fn is_ocelot_available(&self) -> bool {
         let ai_env = self.expand_config_path(&self.config.general.ai_env_path);
         let host = rootfs::container_path_to_host(
             &self.config.general.ocelot_path,
@@ -328,7 +378,7 @@ impl App {
         arguments.push("--port".into());
         arguments.push(self.config.server.serve_port.to_string());
         arguments.push("--hostname".into());
-        arguments.push(self.config.server.serve_host.clone());
+        arguments.push(self.config.server.listen_host.clone());
         let serve_command =
             arguments.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>().join(" ");
         let script = format!("if [ ! -f {marker} ]; then touch {marker}; exec {serve_command}; fi");
@@ -373,6 +423,9 @@ impl App {
         }
         for tmpfs in self.build_tmpfs() {
             builder = builder.tmpfs(tmpfs);
+        }
+        if config.server.publish_port {
+            builder = builder.publish(Publish::new(config.server.serve_port));
         }
         for (key, value) in self.build_env(&self.shell) {
             builder = builder.env(key, value);
@@ -599,13 +652,14 @@ fn kernel_release() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        env, fs,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
     };
 
     use super::{App, InitMode, init_script_for};
     use crate::{
-        config::Config,
+        config::{AgentServe, Config},
         ocelot::render_config,
         workspace::{HostIdentity, ProjectIdentity},
     };
@@ -676,6 +730,60 @@ mod tests {
     }
 
     #[test]
+    fn probe_uses_bash_regardless_of_configured_shell() {
+        let mut config = Config::default();
+        config.general.shell = "/run/ai-env/bin/zsh".into();
+        let home = PathBuf::from("/home/tester");
+        let identity = app().identity;
+        let app = App::new(config, identity, home);
+
+        assert_eq!(app.runtime().probe_shell, "/run/ai-env/bin/bash");
+    }
+
+    #[test]
+    fn attach_command_uses_container_client_and_loopback_url() {
+        let mut app = app();
+        let serve = app.config.agents["opencode"].serve.as_ref().expect("opencode serve");
+        assert_eq!(
+            app.build_attach_command("opencode", serve).expect("attach command"),
+            ["opencode", "attach", "http://localhost:4096"]
+        );
+
+        app.config.server.serve_port = 5000;
+        assert_eq!(
+            app.build_attach_command("opencode", serve)
+                .expect("attach command")
+                .last()
+                .map(String::as_str),
+            Some("http://localhost:5000")
+        );
+        assert!(
+            app.build_attach_command("opencode", &AgentServe::new("opencode serve", "  ")).is_err()
+        );
+    }
+
+    #[test]
+    fn attach_requires_an_already_running_container() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-attach-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let binary = directory.join("podman");
+        fs::write(&binary, "#!/bin/sh\nexit 1\n").expect("write fake podman");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("set executable");
+
+        let mut config = Config::default();
+        config.general.podman_binary = binary.to_string_lossy().into_owned();
+        let identity = app().identity;
+        let app = App::new(config, identity, PathBuf::from("/home/tester"));
+
+        let error = app.require_running_container().expect_err("attach must not start a container");
+        assert!(matches!(error, crate::error::Error::ContainerNotRunning { .. }));
+
+        drop(fs::remove_dir_all(&directory));
+    }
+
+    #[test]
     fn fallback_init_script_uses_keepalive() {
         let config = Config::default();
         let script = init_script_for(&config, "/run/ai-env/bin/bash", InitMode::Fallback);
@@ -685,8 +793,8 @@ mod tests {
 
     #[test]
     fn write_ocelot_config_places_yaml_in_rootfs() {
-        let root = std::env::temp_dir()
-            .join(format!("agentbox-ocelot-config-test-{}", std::process::id()));
+        let root =
+            env::temp_dir().join(format!("agentbox-ocelot-config-test-{}", std::process::id()));
         drop(fs::remove_dir_all(&root));
         fs::create_dir_all(&root).expect("create temp rootfs");
 
@@ -719,5 +827,7 @@ mod tests {
         assert_eq!(opencode["dependsOn"]["keeper"]["condition"].as_str(), Some("Started"));
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("--port")));
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("4096")));
+        assert!(arguments.iter().any(|argument| argument.as_str() == Some("--hostname")));
+        assert!(arguments.iter().any(|argument| argument.as_str() == Some("0.0.0.0")));
     }
 }

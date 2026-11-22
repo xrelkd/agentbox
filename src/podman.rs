@@ -58,6 +58,20 @@ impl Tmpfs {
     fn to_arg(&self) -> OsString { format!("{}:{}", self.target.display(), self.options).into() }
 }
 
+/// Host loopback publication of a container port using an ephemeral host port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Publish {
+    /// Port inside the container.
+    pub container_port: u16,
+}
+
+impl Publish {
+    /// Publishes `container_port` on a randomly assigned host loopback port.
+    pub const fn new(container_port: u16) -> Self { Self { container_port } }
+
+    fn to_arg(self) -> OsString { format!("127.0.0.1::{}", self.container_port).into() }
+}
+
 /// Parsed container state from `podman inspect`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContainerStatus {
@@ -117,6 +131,8 @@ pub struct ContainerInfo {
     pub name: String,
     /// Raw status text from Podman.
     pub status: String,
+    /// Published port mappings from Podman.
+    pub ports: String,
 }
 
 /// Type-safe description of a `podman run` invocation.
@@ -141,6 +157,7 @@ pub struct ContainerSpec {
     mounts: Vec<Mount>,
     tmpfs: Vec<Tmpfs>,
     env: Vec<(String, String)>,
+    publishes: Vec<Publish>,
 }
 
 /// Builds a [`ContainerSpec`] without exposing raw Podman arguments.
@@ -165,6 +182,7 @@ pub struct ContainerSpecBuilder {
     mounts: Vec<Mount>,
     tmpfs: Vec<Tmpfs>,
     env: Vec<(String, String)>,
+    publishes: Vec<Publish>,
 }
 
 /// Readiness probe executed inside the container.
@@ -283,7 +301,7 @@ impl PodmanClient {
         let args = Self::exec_args(name, command, workdir, ExecFlags::Interactive);
         tracing::debug!("Attaching with: podman {}", os_args_to_string(&args));
         let error = Command::new(&self.binary).args(args).exec();
-        Err(error::Error::ExecReplace { source: error })
+        Err(error::Error::ExecReplace { program: self.binary.clone(), source: error })
     }
 
     /// Stops and removes a container, tolerating a missing or already stopped
@@ -314,7 +332,7 @@ impl PodmanClient {
 
     /// Lists agentbox containers.
     pub fn list_containers(&self, prefix: &str) -> Result<Vec<ContainerInfo>> {
-        let format = "{{.Names}}\t{{.Status}}";
+        let format = "{{.Names}}\t{{.Status}}\t{{.Ports}}";
         let filter = format!("name=^{prefix}-");
         let args = os_args(&["ps", "-a", "--filter", &filter, "--format", format]);
         let output = self.run(&args, false)?;
@@ -323,10 +341,13 @@ impl PodmanClient {
             .split(|byte| *byte == b'\n')
             .filter_map(|line| {
                 let line = String::from_utf8_lossy(line);
-                let (name, status) = line.split_once('\t')?;
+                let mut fields = line.split('\t');
+                let name = fields.next()?;
+                let status = fields.next()?;
                 Some(ContainerInfo {
                     name: name.trim().to_owned(),
                     status: status.trim().to_owned(),
+                    ports: fields.next().unwrap_or_default().trim().to_owned(),
                 })
             })
             .collect())
@@ -459,6 +480,10 @@ impl ContainerSpec {
             args.push(OsString::from("-e"));
             args.push(OsString::from(format!("{key}={value}")));
         }
+        for publish in &self.publishes {
+            args.push(OsString::from("-p"));
+            args.push(publish.to_arg());
+        }
 
         let rootfs = if self.rootfs_overlay {
             format!("{}:O", self.rootfs.display())
@@ -515,6 +540,7 @@ impl ContainerSpecBuilder {
             mounts: Vec::new(),
             tmpfs: Vec::new(),
             env: Vec::new(),
+            publishes: Vec::new(),
         }
     }
 
@@ -617,6 +643,12 @@ impl ContainerSpecBuilder {
         self
     }
 
+    /// Publishes a container port on an ephemeral host loopback port.
+    pub fn publish(mut self, publish: Publish) -> Self {
+        self.publishes.push(publish);
+        self
+    }
+
     /// Validates required fields and produces a [`ContainerSpec`].
     pub fn build(self) -> Result<ContainerSpec> {
         Ok(ContainerSpec {
@@ -644,6 +676,7 @@ impl ContainerSpecBuilder {
             mounts: self.mounts,
             tmpfs: self.tmpfs,
             env: self.env,
+            publishes: self.publishes,
         })
     }
 }
@@ -671,10 +704,11 @@ fn command_failure(program: &str, output: &Output) -> error::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{env, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
     use super::{
-        ContainerSpec, ContainerStatus, ExecFlags, Mount, PodmanClient, TcpProbe, shell_quote,
+        ContainerSpec, ContainerStatus, ExecFlags, Mount, PodmanClient, Publish, TcpProbe,
+        shell_quote,
     };
     use crate::error::Error;
 
@@ -693,6 +727,7 @@ mod tests {
             .memory_limit("12g")
             .mount(Mount::new(PathBuf::from("/tmp/host"), PathBuf::from("/tmp"), false))
             .env("OPENROUTER_API_KEY", "super-secret")
+            .publish(Publish::new(4096))
             .build()
             .expect("spec should build")
     }
@@ -709,6 +744,8 @@ mod tests {
         assert!(strings.contains(&"--pids-limit=1024".into()));
         assert!(strings.contains(&"--memory=12g".into()));
         assert!(strings.contains(&"/tmp/host:/tmp:rw".into()));
+        assert!(strings.contains(&"-p".into()));
+        assert!(strings.contains(&"127.0.0.1::4096".into()));
         assert!(strings.contains(&"--rootfs".into()));
         assert!(strings.contains(&"/tmp/rootfs:O".into()));
         assert!(strings.contains(&"OPENROUTER_API_KEY=super-secret".into()));
@@ -774,5 +811,38 @@ mod tests {
             interval: std::time::Duration::from_millis(250),
         };
         assert_eq!(probe.script(), "exec 3<>/dev/tcp/'127.0.0.1'/4096");
+    }
+
+    #[test]
+    fn published_port_is_bound_to_host_loopback_only() {
+        let publish = Publish::new(4096);
+        let arg = publish.to_arg().to_string_lossy().into_owned();
+        assert_eq!(arg, "127.0.0.1::4096");
+        assert!(!arg.contains("0.0.0.0"));
+        assert!(!arg.contains("[::]"));
+    }
+
+    #[test]
+    fn list_containers_includes_published_ports() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-podman-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let binary = directory.join("podman");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'agentbox-demo\\tUp 2 minutes\\t127.0.0.1:39423->4096/tcp\\n'\n",
+        )
+        .expect("write fake podman");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("set executable");
+
+        let client = PodmanClient::new(binary.to_string_lossy().into_owned());
+        let containers = client.list_containers("agentbox").expect("list");
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].name, "agentbox-demo");
+        assert_eq!(containers[0].status, "Up 2 minutes");
+        assert_eq!(containers[0].ports, "127.0.0.1:39423->4096/tcp");
+
+        drop(fs::remove_dir_all(&directory));
     }
 }
