@@ -8,13 +8,18 @@ use std::{
     time::Duration,
 };
 
+use serde::Serialize;
 use snafu::{OptionExt, ResultExt};
 
 use crate::{
+    cli::OutputFormat,
     config::{self, AgentServe, Config},
     error::{self, Result},
     ocelot,
-    podman::{ContainerSpec, ContainerStatus, Mount, PodmanClient, TcpProbe, Tmpfs, shell_quote},
+    podman::{
+        ContainerInfo, ContainerSpec, ContainerStatus, Mount, PodmanClient, TcpProbe, Tmpfs,
+        shell_quote,
+    },
     rootfs,
     workspace::ProjectIdentity,
 };
@@ -32,12 +37,68 @@ enum InitMode {
     Fallback,
 }
 
+impl InitMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ocelot => "ocelot",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
 /// Runtime facts returned when a container is started.
 #[derive(Clone, Debug)]
 struct Runtime {
     mode: InitMode,
     shell: String,
     probe_shell: String,
+}
+
+/// A container row annotated with its relationship to the current project.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ContainerRow {
+    #[serde(flatten)]
+    info: ContainerInfo,
+    current: bool,
+}
+
+/// Read-only summary of a planned bind mount.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct MountSummary {
+    host: String,
+    container: String,
+    read_only: bool,
+}
+
+/// Derived facts about the current project directory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ProjectReport {
+    dir: String,
+    name: String,
+    hash: String,
+    container: String,
+    container_state: String,
+    container_exit_code: String,
+    hostname: String,
+    home: String,
+    tmp: String,
+    meta: String,
+    rootfs: String,
+    config: String,
+    user: String,
+    uid: u32,
+    gid: u32,
+    shell: String,
+    init: String,
+    mounts: Vec<MountSummary>,
+    env: Vec<String>,
+}
+
+/// Payload emitted by `agentbox list --format json`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ListReport {
+    containers: Vec<ContainerRow>,
+    project: ProjectReport,
 }
 
 /// Orchestrates project setup and every agentbox subcommand.
@@ -47,16 +108,22 @@ pub struct App {
     podman: PodmanClient,
     home: PathBuf,
     shell: String,
+    config_path: PathBuf,
 }
 
 impl App {
     /// Builds an application context from loaded configuration and project
     /// identity.
-    pub fn new(config: Config, identity: ProjectIdentity, home: PathBuf) -> Self {
+    pub fn new(
+        config: Config,
+        identity: ProjectIdentity,
+        home: PathBuf,
+        config_path: PathBuf,
+    ) -> Self {
         let ai_env = config::expand_path(Path::new(&config.general.ai_env_path), &home);
         let shell = rootfs::select_shell(&config, &ai_env);
         let podman = PodmanClient::new(config.general.podman_binary.clone());
-        Self { config, identity, podman, home, shell }
+        Self { config, identity, podman, home, shell, config_path }
     }
 
     /// Prints the host temporary directory for the current project.
@@ -69,16 +136,104 @@ impl App {
         println!("{}", self.identity.home_dir.display());
     }
 
-    /// Lists agentbox-managed containers.
-    pub fn list_containers(&self) -> Result<()> {
-        let prefix = &self.config.general.container_prefix;
-        let containers = self.podman.list_containers(prefix)?;
-        println!("{:<48}\t{:<12}\tPORTS", "NAME", "STATUS");
-        for container in containers {
-            let ports = if container.ports.is_empty() { "-" } else { &container.ports };
-            println!("{:<48}\t{:<12}\t{ports}", container.name, container.status);
+    /// Lists agentbox-managed containers and the current project directory.
+    pub fn list_containers(&self, format: OutputFormat, quiet: bool) -> Result<()> {
+        let rows = self.collect_rows()?;
+        if quiet {
+            for row in &rows {
+                println!("{}", row.info.name);
+            }
+            return Ok(());
+        }
+
+        let project = self.project_report(&rows);
+        match format {
+            OutputFormat::Table => print!("{}", format_list_table(&rows, &project)),
+            OutputFormat::Json => {
+                let report = ListReport { containers: rows, project };
+                let json =
+                    serde_json::to_string_pretty(&report).context(error::SerializeOutputSnafu)?;
+                println!("{json}");
+            }
         }
         Ok(())
+    }
+
+    /// Prints derived information about the current project directory.
+    pub fn print_status(&self, format: OutputFormat, quiet: bool) -> Result<()> {
+        if quiet {
+            println!("{}", self.identity.container_name);
+            return Ok(());
+        }
+
+        let project = self.project_report(&self.collect_rows()?);
+        match format {
+            OutputFormat::Table => print!("{}", format_status_table(&project)),
+            OutputFormat::Json => {
+                let json =
+                    serde_json::to_string_pretty(&project).context(error::SerializeOutputSnafu)?;
+                println!("{json}");
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_rows(&self) -> Result<Vec<ContainerRow>> {
+        let prefix = &self.config.general.container_prefix;
+        Ok(self
+            .podman
+            .list_containers(prefix)?
+            .into_iter()
+            .map(|info| ContainerRow { current: info.name == self.identity.container_name, info })
+            .collect())
+    }
+
+    fn project_report(&self, rows: &[ContainerRow]) -> ProjectReport {
+        let (container_state, container_exit_code) =
+            rows.iter().find(|row| row.current).map_or_else(
+                || (String::from("absent"), String::new()),
+                |row| {
+                    let state =
+                        if row.info.state.is_empty() { &row.info.status } else { &row.info.state };
+                    (state.clone(), row.info.exit_code.clone())
+                },
+            );
+
+        let ai_env = self.expand_config_path(&self.config.general.ai_env_path);
+        let mounts = self
+            .build_mounts(&ai_env)
+            .into_iter()
+            .map(|mount| MountSummary {
+                host: mount.host.display().to_string(),
+                container: mount.container.display().to_string(),
+                read_only: mount.read_only,
+            })
+            .collect();
+        let mut env =
+            self.build_env(&self.shell).into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        env.extend(self.config.secrets.entries.keys().cloned());
+
+        ProjectReport {
+            dir: self.identity.project_dir.display().to_string(),
+            name: self.identity.name.clone(),
+            hash: self.identity.hash.clone(),
+            container: self.identity.container_name.clone(),
+            container_state,
+            container_exit_code,
+            hostname: format!("{}-{}", self.config.container.hostname_prefix, self.identity.name),
+            home: self.identity.home_dir.display().to_string(),
+            tmp: self.identity.tmp_dir.display().to_string(),
+            meta: self.identity.meta_dir.display().to_string(),
+            rootfs: self.identity.rootfs_dir.display().to_string(),
+            config: self.config_path.display().to_string(),
+            user: self.identity.host.username.clone(),
+            uid: self.identity.host.uid,
+            gid: self.identity.host.gid,
+            shell: self.shell.clone(),
+            init: self.runtime().mode.as_str().to_owned(),
+            mounts,
+            env,
+        }
     }
 
     /// Stops the project container and removes its transient directories.
@@ -595,6 +750,60 @@ fn kernel_release() -> Option<String> {
     if release.is_empty() { None } else { Some(release) }
 }
 
+fn container_state_label(project: &ProjectReport) -> String {
+    if project.container_exit_code.is_empty() {
+        project.container_state.clone()
+    } else {
+        format!("{} ({})", project.container_state, project.container_exit_code)
+    }
+}
+
+fn format_list_table(rows: &[ContainerRow], project: &ProjectReport) -> String {
+    let mut output = format!("{:<48}\t{:<12}\tPORTS\n", "NAME", "STATUS");
+    for row in rows {
+        let ports = if row.info.ports.is_empty() { "-" } else { &row.info.ports };
+        let _ = writeln!(output, "{:<48}\t{:<12}\t{ports}", row.info.name, row.info.status);
+    }
+
+    let state = container_state_label(project);
+    let _ = writeln!(output, "CURRENT PROJECT");
+    let _ = writeln!(output, "  {:<10}{}", "Dir", project.dir);
+    let _ = writeln!(output, "  {:<10}{} ({})", "Container", project.container, state);
+    let _ = writeln!(output, "  {:<10}{}", "Home", project.home);
+    let _ = writeln!(output, "  {:<10}{}", "Tmp", project.tmp);
+    output
+}
+
+fn format_status_table(project: &ProjectReport) -> String {
+    let state = container_state_label(project);
+    let read_only = project.mounts.iter().filter(|mount| mount.read_only).count();
+    let writable = project.mounts.len() - read_only;
+    let mut output = String::from("CURRENT PROJECT\n");
+    let _ = writeln!(output, "  {:<12}{}", "Dir", project.dir);
+    let _ = writeln!(output, "  {:<12}{}", "Name", project.name);
+    let _ = writeln!(output, "  {:<12}{}", "Hash", project.hash);
+    let _ = writeln!(output, "  {:<12}{} ({})", "Container", project.container, state);
+    let _ = writeln!(output, "  {:<12}{}", "Hostname", project.hostname);
+    let _ = writeln!(output, "  {:<12}{}", "Home", project.home);
+    let _ = writeln!(output, "  {:<12}{}", "Tmp", project.tmp);
+    let _ = writeln!(output, "  {:<12}{}", "Meta", project.meta);
+    let _ = writeln!(output, "  {:<12}{}", "Rootfs", project.rootfs);
+    let _ = writeln!(output, "  {:<12}{}", "Config", project.config);
+    let _ = writeln!(output, "  {:<12}{} ({}:{})", "User", project.user, project.uid, project.gid);
+    let _ = writeln!(output, "  {:<12}{}", "Shell", project.shell);
+    let _ = writeln!(output, "  {:<12}{}", "Init", project.init);
+    let _ = writeln!(
+        output,
+        "  {:<12}{} ({} ro, {} rw)",
+        "Mounts",
+        project.mounts.len(),
+        read_only,
+        writable
+    );
+    let _ = writeln!(output, "  {:<12}{} ({})", "Env", project.env.len(), project.env.join(", "));
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -603,10 +812,14 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{App, InitMode, init_script_for};
+    use super::{
+        App, ContainerRow, InitMode, ListReport, MountSummary, ProjectReport, format_list_table,
+        format_status_table, init_script_for,
+    };
     use crate::{
         config::{AgentServe, Config, MountEntry},
         ocelot::render_config,
+        podman::ContainerInfo,
         workspace::{HostIdentity, ProjectIdentity},
     };
 
@@ -631,7 +844,7 @@ mod tests {
         let mut config = Config::default();
         config.nix.enable_daemon_mount = false;
         config.nix.mount_kernel_modules = false;
-        App::new(config, identity, home)
+        App::new(config, identity, home, PathBuf::from("/home/tester/.config/agentbox/config.yaml"))
     }
 
     #[test]
@@ -719,6 +932,11 @@ mod tests {
         assert_eq!(content, "TEST_TOKEN=s3cr3t\n");
         assert_eq!(fs::metadata(&path).expect("metadata").permissions().mode() & 0o777, 0o600);
 
+        let report = app.project_report(&[]);
+        assert!(report.env.contains(&"TEST_TOKEN".to_owned()));
+        let json = serde_json::to_string(&report).expect("serialize project report");
+        assert!(!json.contains("s3cr3t"));
+
         drop(fs::remove_dir_all(&root));
     }
 
@@ -743,7 +961,7 @@ mod tests {
         config.general.shell = "zsh".into();
         let home = PathBuf::from("/home/tester");
         let identity = app().identity;
-        let app = App::new(config, identity, home);
+        let app = App::new(config, identity, home, PathBuf::from("/config.yaml"));
 
         assert_eq!(app.runtime().probe_shell, "/run/ai-env/bin/bash");
     }
@@ -783,7 +1001,12 @@ mod tests {
         let mut config = Config::default();
         config.general.podman_binary = binary.to_string_lossy().into_owned();
         let identity = app().identity;
-        let app = App::new(config, identity, PathBuf::from("/home/tester"));
+        let app = App::new(
+            config,
+            identity,
+            PathBuf::from("/home/tester"),
+            PathBuf::from("/config.yaml"),
+        );
 
         let error = app.require_running_container().expect_err("attach must not start a container");
         assert!(matches!(error, crate::error::Error::ContainerNotRunning { .. }));
@@ -846,5 +1069,101 @@ mod tests {
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("4096")));
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("--hostname")));
         assert!(arguments.iter().any(|argument| argument.as_str() == Some("127.0.0.1")));
+    }
+
+    fn container_row(name: &str, current: bool) -> ContainerRow {
+        ContainerRow {
+            info: ContainerInfo {
+                id: "abc123".into(),
+                name: name.into(),
+                status: "Up 2 minutes".into(),
+                state: "running".into(),
+                exit_code: String::new(),
+                created: "2 minutes ago".into(),
+                running_for: "2 minutes".into(),
+                ports: String::new(),
+            },
+            current,
+        }
+    }
+
+    fn project_report() -> ProjectReport {
+        ProjectReport {
+            dir: "/work/project".into(),
+            name: "project".into(),
+            hash: "deadbeef".into(),
+            container: "agentbox-project-deadbeef".into(),
+            container_state: "running".into(),
+            container_exit_code: String::new(),
+            hostname: "sandbox-project".into(),
+            home: "/tmp/agentbox-home-1000-project-deadbeef".into(),
+            tmp: "/tmp/agentbox-tmp-1000-project-deadbeef".into(),
+            meta: "/tmp/agentbox-meta-1000-project-deadbeef".into(),
+            rootfs: "/tmp/agentbox-meta-1000-project-deadbeef/rootfs".into(),
+            config: "/home/tester/.config/agentbox/config.yaml".into(),
+            user: "tester".into(),
+            uid: 1000,
+            gid: 1000,
+            shell: "zsh".into(),
+            init: "ocelot".into(),
+            mounts: vec![
+                MountSummary {
+                    host: "/work/project".into(),
+                    container: "/workspace".into(),
+                    read_only: false,
+                },
+                MountSummary {
+                    host: "/nix/store".into(),
+                    container: "/nix/store".into(),
+                    read_only: true,
+                },
+            ],
+            env: vec!["HOME".into(), "PATH".into(), "TEST_TOKEN".into()],
+        }
+    }
+
+    #[test]
+    fn list_table_keeps_columns_and_adds_current_project() {
+        let rows = vec![
+            container_row("agentbox-project-deadbeef", true),
+            container_row("agentbox-other-12345678", false),
+        ];
+        let output = format_list_table(&rows, &project_report());
+
+        assert!(output.starts_with("NAME"));
+        assert!(output.contains("STATUS"));
+        assert!(output.contains("PORTS"));
+        assert!(output.contains("agentbox-other-12345678"));
+        assert!(output.contains("CURRENT PROJECT"));
+        assert!(output.contains("/tmp/agentbox-home-1000-project-deadbeef"));
+        assert!(output.contains("/tmp/agentbox-tmp-1000-project-deadbeef"));
+        assert!(output.contains("agentbox-project-deadbeef (running)"));
+    }
+
+    #[test]
+    fn status_table_reports_identity_mounts_and_env_names() {
+        let output = format_status_table(&project_report());
+
+        assert!(output.contains("/work/project"));
+        assert!(output.contains("deadbeef"));
+        assert!(output.contains("sandbox-project"));
+        assert!(output.contains("2 (1 ro, 1 rw)"));
+        assert!(output.contains("TEST_TOKEN"));
+    }
+
+    #[test]
+    fn list_json_contains_containers_and_project() {
+        let report = ListReport {
+            containers: vec![container_row("agentbox-project-deadbeef", true)],
+            project: project_report(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize list report");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse list report");
+
+        assert_eq!(value["containers"][0]["name"], "agentbox-project-deadbeef");
+        assert_eq!(value["containers"][0]["current"], true);
+        assert_eq!(value["project"]["hash"], "deadbeef");
+        assert_eq!(value["project"]["home"], "/tmp/agentbox-home-1000-project-deadbeef");
+        assert_eq!(value["project"]["tmp"], "/tmp/agentbox-tmp-1000-project-deadbeef");
     }
 }

@@ -48,6 +48,9 @@ pub enum Error {
     #[snafu(display("Could not serialize ocelot supervise config: {source}"))]
     SerializeOcelotConfig { source: serde_yaml::Error },
 
+    #[snafu(display("Could not serialize output: {source}"))]
+    SerializeOutput { source: serde_json::Error },
+
     #[snafu(display("Could not create directory `{}`: {source}", path.display()))]
     CreateDir { path: PathBuf, source: std::io::Error },
 

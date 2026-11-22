@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::Serialize;
 use snafu::{OptionExt, ResultExt};
 
 use crate::error::{self, Result};
@@ -123,12 +124,22 @@ impl From<&str> for ContainerStatus {
 }
 
 /// Brief container entry from `podman ps`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ContainerInfo {
+    /// Short container ID.
+    pub id: String,
     /// Container name.
     pub name: String,
     /// Raw status text from Podman.
     pub status: String,
+    /// Machine-readable container state.
+    pub state: String,
+    /// Exit code of a stopped container.
+    pub exit_code: String,
+    /// Human-readable creation time.
+    pub created: String,
+    /// Human-readable time since the container started.
+    pub running_for: String,
     /// Published port mappings from Podman.
     pub ports: String,
 }
@@ -312,7 +323,10 @@ impl PodmanClient {
 
     /// Lists agentbox containers.
     pub fn list_containers(&self, prefix: &str) -> Result<Vec<ContainerInfo>> {
-        let format = "{{.Names}}\t{{.Status}}\t{{.Ports}}";
+        let format = concat!(
+            "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.State}}\t",
+            "{{.ExitCode}}\t{{.CreatedHuman}}\t{{.RunningFor}}\t{{.Ports}}"
+        );
         let filter = format!("name=^{prefix}-");
         let args = os_args(&["ps", "-a", "--filter", &filter, "--format", format]);
         let output = self.run(&args, false)?;
@@ -322,11 +336,17 @@ impl PodmanClient {
             .filter_map(|line| {
                 let line = String::from_utf8_lossy(line);
                 let mut fields = line.split('\t');
+                let id = fields.next()?;
                 let name = fields.next()?;
                 let status = fields.next()?;
                 Some(ContainerInfo {
+                    id: id.trim().to_owned(),
                     name: name.trim().to_owned(),
                     status: status.trim().to_owned(),
+                    state: fields.next().unwrap_or_default().trim().to_owned(),
+                    exit_code: fields.next().unwrap_or_default().trim().to_owned(),
+                    created: fields.next().unwrap_or_default().trim().to_owned(),
+                    running_for: fields.next().unwrap_or_default().trim().to_owned(),
                     ports: fields.next().unwrap_or_default().trim().to_owned(),
                 })
             })
@@ -869,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn list_containers_includes_published_ports() {
+    fn list_containers_parses_rich_fields() {
         let directory =
             env::temp_dir().join(format!("agentbox-podman-test-{}", std::process::id()));
         drop(fs::remove_dir_all(&directory));
@@ -877,7 +897,8 @@ mod tests {
         let binary = directory.join("podman");
         fs::write(
             &binary,
-            "#!/bin/sh\nprintf 'agentbox-demo\\tUp 2 minutes\\t127.0.0.1:39423->4096/tcp\\n'\n",
+            "#!/bin/sh\nprintf 'abc123\\tagentbox-demo\\tUp 2 minutes\\trunning\\t0\\t2 minutes \
+             ago\\t2 minutes\\t127.0.0.1:39423->4096/tcp\\n'\n",
         )
         .expect("write fake podman");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("set executable");
@@ -885,8 +906,13 @@ mod tests {
         let client = PodmanClient::new(binary.to_string_lossy().into_owned());
         let containers = client.list_containers("agentbox").expect("list");
         assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].id, "abc123");
         assert_eq!(containers[0].name, "agentbox-demo");
         assert_eq!(containers[0].status, "Up 2 minutes");
+        assert_eq!(containers[0].state, "running");
+        assert_eq!(containers[0].exit_code, "0");
+        assert_eq!(containers[0].created, "2 minutes ago");
+        assert_eq!(containers[0].running_for, "2 minutes");
         assert_eq!(containers[0].ports, "127.0.0.1:39423->4096/tcp");
 
         drop(fs::remove_dir_all(&directory));

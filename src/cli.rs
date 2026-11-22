@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use snafu::OptionExt;
 
@@ -32,6 +32,16 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+/// Output format for listing commands.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable output.
+    #[default]
+    Table,
+    /// JSON document.
+    Json,
+}
+
 /// Supported agentbox subcommands.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
@@ -53,9 +63,29 @@ pub enum Command {
         purge_home: bool,
     },
 
-    /// List agentbox-managed containers.
+    /// List agentbox-managed containers and the current project directory.
     #[command(aliases = ["ps", "ls"])]
-    List,
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
+
+        /// Print only container names.
+        #[arg(short, long, conflicts_with = "format")]
+        quiet: bool,
+    },
+
+    /// Show identity and paths for the current project directory.
+    #[command(aliases = ["info", "project"])]
+    Status {
+        /// Emit JSON instead of a key/value report.
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
+
+        /// Print only the project container name.
+        #[arg(short, long, conflicts_with = "format")]
+        quiet: bool,
+    },
 
     /// Attach to a shell session in the running container.
     Shell,
@@ -117,7 +147,9 @@ pub enum ConfigAction {
 
 impl Cli {
     /// Returns the selected command, defaulting to a container listing.
-    pub fn command_or_default(&self) -> Command { self.command.clone().unwrap_or(Command::List) }
+    pub fn command_or_default(&self) -> Command {
+        self.command.clone().unwrap_or(Command::List { format: None, quiet: false })
+    }
 
     /// Executes the selected command.
     pub fn run(&self) -> Result<()> {
@@ -148,12 +180,17 @@ impl Cli {
         let config = Config::load(&config_path)?;
         let command = self.command_or_default();
         let identity = ProjectIdentity::resolve(&home, &config)?;
-        let app = App::new(config, identity, home);
+        let app = App::new(config, identity, home, config_path);
 
         match command {
             Command::Start { attach, agent } => app.start(agent.as_deref(), attach),
             Command::Stop { purge_home } => app.stop_project(purge_home),
-            Command::List => app.list_containers(),
+            Command::List { format, quiet } => {
+                app.list_containers(format.unwrap_or_default(), quiet)
+            }
+            Command::Status { format, quiet } => {
+                app.print_status(format.unwrap_or_default(), quiet)
+            }
             Command::Agent { name } => app.launch_agent(&name),
             Command::Opencode => app.launch_agent("opencode"),
             Command::Claude => app.launch_agent("claude"),
@@ -178,12 +215,12 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, ConfigAction};
+    use super::{Cli, Command, ConfigAction, OutputFormat};
 
     #[test]
     fn defaults_to_list() {
         let cli = Cli::try_parse_from(["agentbox"]).expect("parse empty args");
-        assert!(matches!(cli.command_or_default(), Command::List));
+        assert!(matches!(cli.command_or_default(), Command::List { format: None, quiet: false }));
         assert_eq!(cli.verbose, 0);
     }
 
@@ -191,7 +228,7 @@ mod tests {
     fn default_ignores_config_option() {
         let cli = Cli::try_parse_from(["agentbox", "--config", "/tmp/agentbox.yaml"])
             .expect("parse config option");
-        assert!(matches!(cli.command_or_default(), Command::List));
+        assert!(matches!(cli.command_or_default(), Command::List { format: None, quiet: false }));
     }
 
     #[test]
@@ -217,7 +254,35 @@ mod tests {
         assert!(matches!(oc.command, Some(Command::Opencode)));
 
         let list = Cli::try_parse_from(["agentbox", "ls"]).expect("parse ls");
-        assert!(matches!(list.command, Some(Command::List)));
+        assert!(matches!(list.command, Some(Command::List { .. })));
+    }
+
+    #[test]
+    fn parses_list_output_flags() {
+        let json =
+            Cli::try_parse_from(["agentbox", "ls", "--format", "json"]).expect("parse list json");
+        assert!(matches!(
+            json.command,
+            Some(Command::List { format: Some(OutputFormat::Json), quiet: false })
+        ));
+
+        let quiet = Cli::try_parse_from(["agentbox", "list", "-q"]).expect("parse list quiet");
+        assert!(matches!(quiet.command, Some(Command::List { format: None, quiet: true })));
+
+        assert!(Cli::try_parse_from(["agentbox", "ls", "-q", "--format", "json"]).is_err());
+    }
+
+    #[test]
+    fn parses_status_command() {
+        let status = Cli::try_parse_from(["agentbox", "status"]).expect("parse status");
+        assert!(matches!(status.command, Some(Command::Status { format: None, quiet: false })));
+
+        let info = Cli::try_parse_from(["agentbox", "info", "--format", "json"])
+            .expect("parse status alias");
+        assert!(matches!(
+            info.command,
+            Some(Command::Status { format: Some(OutputFormat::Json), quiet: false })
+        ));
     }
 
     #[test]
