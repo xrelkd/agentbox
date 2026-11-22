@@ -170,7 +170,8 @@ mod tests {
         let root = test_root("hash");
         let real = root.join("real-project");
         let link = root.join("linked-project");
-        let _ = fs::remove_dir_all(&root);
+
+        drop(fs::remove_dir_all(&root));
         fs::create_dir_all(&real).expect("create real project");
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
 

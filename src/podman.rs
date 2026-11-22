@@ -219,7 +219,7 @@ impl PodmanClient {
     pub fn run_detached(&self, spec: &ContainerSpec) -> Result<()> {
         let args = spec.build_args();
         tracing::debug!("Starting container with: {}", ContainerSpec::redacted_args(&args));
-        let _ = self.run(&args, false)?;
+        drop(self.run(&args, false)?);
         Ok(())
     }
 
@@ -264,23 +264,26 @@ impl PodmanClient {
     /// Stops and removes a container, tolerating a missing or already stopped
     /// container.
     pub fn stop_and_remove(&self, name: &str) -> Result<()> {
-        for action in ["stop", "rm -f"] {
-            let mut parts = action.split_whitespace();
-            let command = parts.next().unwrap_or("");
-            let mut args = vec![OsString::from(command)];
-            if command == "rm" {
-                args.push(OsString::from("-f"));
-            }
-            args.push(OsString::from(name));
-            let output = self.run(&args, true)?;
-            if !output.status.success() {
-                tracing::warn!(
-                    "podman {action} {name} returned {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
+        let stop_args = os_args(&["stop", name]);
+        let stop_output = self.run(&stop_args, true)?;
+        if !stop_output.status.success() {
+            tracing::warn!(
+                "podman stop {name} returned {}: {}",
+                stop_output.status,
+                String::from_utf8_lossy(&stop_output.stderr).trim()
+            );
         }
+
+        let remove_args = os_args(&["rm", "-f", name]);
+        let remove_output = self.run(&remove_args, true)?;
+        if !remove_output.status.success() {
+            tracing::warn!(
+                "podman rm -f {name} returned {}: {}",
+                remove_output.status,
+                String::from_utf8_lossy(&remove_output.stderr).trim()
+            );
+        }
+
         Ok(())
     }
 

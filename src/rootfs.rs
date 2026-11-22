@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn prepare_creates_expected_skeleton_and_accounts() {
         let root = test_root("prepare");
-        let _ = fs::remove_dir_all(&root);
+        drop(fs::remove_dir_all(&root));
         let project = identity(&root);
         fs::create_dir_all(root.join("home")).expect("create home");
         fs::create_dir_all(root.join("ai-env/bin")).expect("create ai env bin");

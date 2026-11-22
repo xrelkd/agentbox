@@ -43,7 +43,7 @@ fn init_tracing(verbose: u8) {
         },
     };
     let filter = EnvFilter::new(directive);
-    let _ = fmt().with_env_filter(filter).with_target(false).without_time().try_init();
+    drop(fmt().with_env_filter(filter).with_target(false).without_time().try_init());
 }
 
 fn run(cli: &Cli) -> Result<()> {
