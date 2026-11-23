@@ -9,9 +9,9 @@ general:
   ai_env_path: "~/.local/share/agentbox-env"
   # Prefix for generated container, home, temporary, and metadata names.
   container_prefix: "agentbox"
-  # Host base directory used for home, temporary, and metadata directories.
-  runtime_base_dir: "/tmp"
-  # Project directories agentbox refuses to run from; root is always rejected.
+  # Host base directory containing <uid>-<name>-<hash>/{home,tmp,meta}.
+  runtime_base_dir: "/tmp/agentbox"
+  # Project directories `start` refuses to use; root is always rejected.
   forbidden_dirs: ["/", "/tmp"]
   # Names searched under <ai_env_path>/bin.
   shell: "zsh"

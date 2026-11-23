@@ -1,6 +1,6 @@
 use comfy_table::{Cell, ContentArrangement, Table, presets::NOTHING};
 
-use crate::app::{ContainerRow, ProjectReport};
+use crate::app::{ContainerRow, MountSummary, ProjectReport};
 
 const TABLE_WIDTH: u16 = 120;
 
@@ -36,9 +36,6 @@ pub fn render_list(rows: &[ContainerRow], project: &ProjectReport) -> String {
 }
 
 pub fn render_status(project: &ProjectReport) -> String {
-    let read_only = project.mounts.iter().filter(|mount| mount.read_only).count();
-    let writable = project.mounts.len() - read_only;
-
     let mut output = String::from("CURRENT PROJECT\n");
     output.push_str(&render_rows(&[
         ("Dir", project.dir.clone()),
@@ -54,10 +51,33 @@ pub fn render_status(project: &ProjectReport) -> String {
         ("User", format!("{} ({}:{})", project.user, project.uid, project.gid)),
         ("Shell", project.shell.clone()),
         ("Init", project.init.clone()),
-        ("Mounts", format!("{} ({} ro, {} rw)", project.mounts.len(), read_only, writable)),
         ("Env", format!("{} ({})", project.env.len(), project.env.join(", "))),
     ]));
+    output.push_str("MOUNTS\n");
+    output.push_str(&render_mounts(&project.mounts));
     output
+}
+
+fn render_mounts(mounts: &[MountSummary]) -> String {
+    let mut table = Table::new();
+    let _ = table
+        .load_style(NOTHING)
+        .set_width(TABLE_WIDTH)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["  MODE", "HOST", "CONTAINER"]);
+
+    for mount in mounts {
+        let mode = if mount.read_only { "ro" } else { "rw" };
+        let _ = table.add_row(vec![
+            Cell::new(format!("  {mode}")),
+            Cell::new(&mount.host),
+            Cell::new(&mount.container),
+        ]);
+    }
+    for column in table.column_iter_mut() {
+        let _ = column.set_padding((0, 1));
+    }
+    table.to_string()
 }
 
 fn render_rows(rows: &[(&str, String)]) -> String {

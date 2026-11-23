@@ -2,7 +2,7 @@ use std::{
     env,
     fmt::Write,
     fs::{self, Permissions},
-    io::IsTerminal,
+    io::{self, IsTerminal},
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -25,7 +25,7 @@ use crate::{
         shell_quote,
     },
     rootfs, ui,
-    workspace::ProjectIdentity,
+    workspace::{self, ProjectIdentity},
 };
 
 /// Init strategy selected for a container.
@@ -44,6 +44,15 @@ impl InitMode {
             Self::Fallback => "fallback",
         }
     }
+}
+
+/// Required state of a container selected outside its project directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetRequirement {
+    /// Accept managed containers in any state.
+    Any,
+    /// Accept only running managed containers.
+    Running,
 }
 
 /// Runtime facts returned when a container is started.
@@ -202,6 +211,87 @@ impl App {
             .collect())
     }
 
+    /// Resolves the container a non-start command should operate on.
+    pub fn resolve_target(
+        &self,
+        explicit: Option<&str>,
+        requirement: TargetRequirement,
+    ) -> Result<Self> {
+        let mut candidates = self
+            .podman
+            .list_containers(&self.config.general.container_prefix)?
+            .into_iter()
+            .filter(|info| {
+                requirement != TargetRequirement::Running || Self::container_is_running(info)
+            })
+            .collect::<Vec<_>>();
+        snafu::ensure!(!candidates.is_empty(), error::NoManagedContainersSnafu);
+
+        let selected = match explicit {
+            Some(name) => candidates
+                .into_iter()
+                .find(|info| info.name == name)
+                .with_context(|| error::ContainerNotFoundSnafu { name: name.to_owned() })?,
+            None if candidates.iter().any(|info| info.name == self.identity.container_name) => {
+                let current = self.identity.container_name.clone();
+                candidates
+                    .into_iter()
+                    .find(|info| info.name == current)
+                    .with_context(|| error::ContainerNotFoundSnafu { name: current })?
+            }
+            None => {
+                if candidates.len() == 1 {
+                    candidates.remove(0)
+                } else if !io::stdin().is_terminal() {
+                    let names = candidates
+                        .iter()
+                        .map(|info| info.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(error::Error::AmbiguousContainer { names });
+                } else {
+                    Self::pick_container(&candidates)?
+                }
+            }
+        };
+
+        let workdir = self.expand_config_path(&self.config.container.workdir);
+        let project_dir =
+            self.podman.container_mount_source(&selected.name, &workdir)?.with_context(|| {
+                error::ProjectDirectoryNotFoundSnafu { name: selected.name.clone() }
+            })?;
+        let identity = ProjectIdentity::from_container(
+            &selected.name,
+            project_dir,
+            &self.identity.host,
+            &self.home,
+            &self.config,
+        )?;
+        Ok(Self::new(self.config.clone(), identity, self.home.clone(), self.config_path.clone()))
+    }
+
+    fn pick_container(candidates: &[ContainerInfo]) -> Result<ContainerInfo> {
+        let items = candidates
+            .iter()
+            .map(|info| {
+                let status = if info.status.is_empty() { &info.state } else { &info.status };
+                ui::fuzzy::PickerItem::new(format!("{}  [{status}]", info.name), info.name.clone())
+            })
+            .collect::<Vec<_>>();
+        let selected = ui::fuzzy::select_value("Container: ", &items)?
+            .with_context(|| error::ContainerPickerCancelledSnafu)?;
+        candidates
+            .iter()
+            .find(|info| info.name == selected)
+            .cloned()
+            .with_context(|| error::ContainerNotFoundSnafu { name: selected })
+    }
+
+    fn container_is_running(info: &ContainerInfo) -> bool {
+        ContainerStatus::from(info.state.as_str()).is_running()
+            || info.status.to_ascii_lowercase().starts_with("up")
+    }
+
     fn project_report(&self, rows: &[ContainerRow]) -> ProjectReport {
         let (container_state, container_exit_code) =
             rows.iter().find(|row| row.current).map_or_else(
@@ -271,11 +361,27 @@ impl App {
                 tracing::info!("Cleaned up directory: {}", directory.display());
             }
         }
+
+        if self.identity.runtime_dir.exists() {
+            match fs::remove_dir(&self.identity.runtime_dir) {
+                Ok(()) => {
+                    tracing::info!("Cleaned up directory: {}", self.identity.runtime_dir.display());
+                }
+                Err(source) if source.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                Err(source) => {
+                    tracing::debug!(
+                        "Could not remove {}: {source}",
+                        self.identity.runtime_dir.display()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
     /// Starts the container, optionally attaching to an agent afterwards.
     pub fn start(&self, agent: Option<&str>, attach: bool) -> Result<()> {
+        workspace::validate_forbidden_dir(&self.identity.project_dir, &self.home, &self.config)?;
         let runtime = self.start_container()?;
         if runtime.mode == InitMode::Fallback
             && let Some(name) = self.startup_serve_agent(agent)
@@ -374,7 +480,7 @@ impl App {
             timeout: Duration::from_secs(self.config.server.startup_timeout_secs),
             interval: Duration::from_millis(self.config.server.poll_interval_ms),
         };
-        let spinner = std::io::stderr().is_terminal().then(|| {
+        let spinner = io::stderr().is_terminal().then(|| {
             let bar = ProgressBar::new_spinner();
             bar.set_message(format!("Waiting for {agent_name} server in {name}..."));
             bar.enable_steady_tick(Duration::from_millis(100));
@@ -802,13 +908,14 @@ mod tests {
     };
 
     use super::{
-        App, ContainerRow, InitMode, ListReport, MountSummary, ProjectReport, agent_candidates,
-        init_script_for,
+        App, ContainerRow, InitMode, ListReport, MountSummary, ProjectReport, TargetRequirement,
+        agent_candidates, init_script_for,
     };
     use crate::{
         config::{AgentServe, Config, MountEntry},
+        error::Error,
         ocelot::render_config,
-        podman::ContainerInfo,
+        podman::{ContainerInfo, PodmanClient},
         ui::table::{render_list, render_status},
         workspace::{HostIdentity, ProjectIdentity},
     };
@@ -820,10 +927,11 @@ mod tests {
             name: "project".into(),
             hash: "deadbeef".into(),
             container_name: "agentbox-project-deadbeef".into(),
-            tmp_dir: PathBuf::from("/tmp/agentbox-tmp-1000-project-deadbeef"),
-            home_dir: PathBuf::from("/tmp/agentbox-home-1000-project-deadbeef"),
-            meta_dir: PathBuf::from("/tmp/agentbox-meta-1000-project-deadbeef"),
-            rootfs_dir: PathBuf::from("/tmp/agentbox-meta-1000-project-deadbeef/rootfs"),
+            runtime_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef"),
+            tmp_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/tmp"),
+            home_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/home"),
+            meta_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/meta"),
+            rootfs_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/meta/rootfs"),
             host: HostIdentity {
                 uid: 1000,
                 gid: 1000,
@@ -835,6 +943,19 @@ mod tests {
         config.nix.enable_daemon_mount = false;
         config.nix.mount_kernel_modules = false;
         App::new(config, identity, home, PathBuf::from("/home/tester/.config/agentbox/config.yaml"))
+    }
+
+    fn fake_podman(directory: &Path, body: &str) -> String {
+        let binary = directory.join("podman");
+        fs::write(&binary, format!("#!/bin/sh\n{body}\n")).expect("write fake podman");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("set executable");
+        binary.to_string_lossy().into_owned()
+    }
+
+    fn use_fake_podman(app: &mut App, directory: &Path, body: &str) {
+        let binary = fake_podman(directory, body);
+        app.config.general.podman_binary = binary.clone();
+        app.podman = PodmanClient::new(binary);
     }
 
     #[test]
@@ -1019,7 +1140,7 @@ mod tests {
         );
 
         let error = app.require_running_container().expect_err("attach must not start a container");
-        assert!(matches!(error, crate::error::Error::ContainerNotRunning { .. }));
+        assert!(matches!(error, Error::ContainerNotRunning { .. }));
 
         drop(fs::remove_dir_all(&directory));
     }
@@ -1106,10 +1227,10 @@ mod tests {
             container_state: "running".into(),
             container_exit_code: String::new(),
             hostname: "sandbox-project".into(),
-            home: "/tmp/agentbox-home-1000-project-deadbeef".into(),
-            tmp: "/tmp/agentbox-tmp-1000-project-deadbeef".into(),
-            meta: "/tmp/agentbox-meta-1000-project-deadbeef".into(),
-            rootfs: "/tmp/agentbox-meta-1000-project-deadbeef/rootfs".into(),
+            home: "/tmp/agentbox/1000-project-deadbeef/home".into(),
+            tmp: "/tmp/agentbox/1000-project-deadbeef/tmp".into(),
+            meta: "/tmp/agentbox/1000-project-deadbeef/meta".into(),
+            rootfs: "/tmp/agentbox/1000-project-deadbeef/meta/rootfs".into(),
             config: "/home/tester/.config/agentbox/config.yaml".into(),
             user: "tester".into(),
             uid: 1000,
@@ -1149,8 +1270,8 @@ mod tests {
         assert!(output.contains("PORTS"));
         assert!(output.contains("agentbox-other-12345678"));
         assert!(output.contains("CURRENTPROJECT"));
-        assert!(output.contains("/tmp/agentbox-home-1000-project-deadbeef"));
-        assert!(output.contains("/tmp/agentbox-tmp-1000-project-deadbeef"));
+        assert!(output.contains("/tmp/agentbox/1000-project-deadbeef/home"));
+        assert!(output.contains("/tmp/agentbox/1000-project-deadbeef/tmp"));
         assert!(output.contains("agentbox-project-deadbeef(running)"));
     }
 
@@ -1161,7 +1282,10 @@ mod tests {
         assert!(output.contains("/work/project"));
         assert!(output.contains("deadbeef"));
         assert!(output.contains("sandbox-project"));
-        assert!(output.contains("2(1ro,1rw)"));
+        assert!(output.contains("MOUNTS"));
+        assert!(output.contains("MODEHOSTCONTAINER"));
+        assert!(output.contains("ro/nix/store/nix/store"));
+        assert!(output.contains("rw/work/project/workspace"));
         assert!(output.contains("TEST_TOKEN"));
     }
 
@@ -1177,7 +1301,92 @@ mod tests {
         assert_eq!(value["containers"][0]["name"], "agentbox-project-deadbeef");
         assert_eq!(value["containers"][0]["current"], true);
         assert_eq!(value["project"]["hash"], "deadbeef");
-        assert_eq!(value["project"]["home"], "/tmp/agentbox-home-1000-project-deadbeef");
-        assert_eq!(value["project"]["tmp"], "/tmp/agentbox-tmp-1000-project-deadbeef");
+        assert_eq!(value["project"]["home"], "/tmp/agentbox/1000-project-deadbeef/home");
+        assert_eq!(value["project"]["tmp"], "/tmp/agentbox/1000-project-deadbeef/tmp");
+    }
+
+    #[test]
+    fn resolve_target_uses_explicit_container_and_grouped_paths() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-target-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let script = r#"case "$1" in
+  ps) printf 'abc123\tagentbox-project-deadbeef\tUp 2 minutes\trunning\t0\t2 minutes ago\t2 minutes\t\n' ;;
+  inspect) printf '%s\n' '[{"Destination":"/workspace","Source":"/work/other"}]' ;;
+esac"#;
+        let mut app = app();
+        use_fake_podman(&mut app, &directory, script);
+
+        let target = app
+            .resolve_target(Some("agentbox-project-deadbeef"), TargetRequirement::Any)
+            .expect("resolve target");
+
+        assert_eq!(target.identity.container_name, "agentbox-project-deadbeef");
+        assert_eq!(target.identity.project_dir, PathBuf::from("/work/other"));
+        assert_eq!(
+            target.identity.runtime_dir,
+            PathBuf::from("/tmp/agentbox/1000-project-deadbeef")
+        );
+        assert!(target.identity.meta_dir.starts_with(&target.identity.runtime_dir));
+
+        drop(fs::remove_dir_all(&directory));
+    }
+
+    #[test]
+    fn resolve_target_requires_choice_for_multiple_containers_without_tty() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-ambiguous-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let script = r"printf 'a\tagentbox-one\tUp 1 minute\trunning\t0\t1 minute\t1 minute\t\n'
+printf 'b\tagentbox-two\tUp 2 minutes\trunning\t0\t2 minutes\t2 minutes\t\n'";
+        let mut app = app();
+        use_fake_podman(&mut app, &directory, script);
+        app.identity.container_name = "agentbox-absent-00000000".into();
+
+        let error = app.resolve_target(None, TargetRequirement::Any).err().expect("ambiguous");
+        assert!(matches!(error, Error::AmbiguousContainer { .. }));
+
+        drop(fs::remove_dir_all(&directory));
+    }
+
+    #[test]
+    fn resolve_target_filters_stopped_containers_for_attach() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-stopped-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let script = r"printf 'a\tagentbox-one\tExited\texited\t0\t1 minute\t1 minute\t\n'";
+        let mut app = app();
+        use_fake_podman(&mut app, &directory, script);
+
+        let error = app
+            .resolve_target(None, TargetRequirement::Running)
+            .err()
+            .expect("no running containers");
+        assert!(matches!(error, Error::NoManagedContainers));
+
+        drop(fs::remove_dir_all(&directory));
+    }
+
+    #[test]
+    fn start_rejects_forbidden_directory_before_running_podman() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-forbidden-start-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let marker = directory.join("podman-ran");
+        let script = format!("touch {}", marker.display());
+        let mut app = app();
+        use_fake_podman(&mut app, &directory, &script);
+        app.config.general.forbidden_dirs = vec!["/tmp".into()];
+        app.identity.project_dir = PathBuf::from("/tmp/work/project");
+
+        let error = app.start(None, false).expect_err("forbidden directory");
+        assert!(matches!(error, Error::ForbiddenDirectory { .. }));
+        assert!(!marker.exists());
+
+        drop(fs::remove_dir_all(&directory));
     }
 }

@@ -48,9 +48,9 @@ pub struct GeneralConfig {
     pub ai_env_path: String,
     /// Prefix used for generated container, home, temp, and metadata names.
     pub container_prefix: String,
-    /// Host base directory for home, temporary, and metadata directories.
+    /// Host base directory containing `<uid>-<name>-<hash>/{home,tmp,meta}`.
     pub runtime_base_dir: String,
-    /// Project directories that are rejected before any container is created.
+    /// Project directories that `start` rejects before creating a container.
     pub forbidden_dirs: Vec<String>,
     /// Preferred container shell; falls back to bash when it is unavailable.
     pub shell: String,
@@ -255,7 +255,7 @@ impl Default for GeneralConfig {
         Self {
             ai_env_path: "~/.local/share/agentbox-env".into(),
             container_prefix: "agentbox".into(),
-            runtime_base_dir: "/tmp".into(),
+            runtime_base_dir: "/tmp/agentbox".into(),
             forbidden_dirs: vec!["/".into(), "/tmp".into()],
             shell: "zsh".into(),
             default_agent: "shell".into(),

@@ -18,8 +18,29 @@ pub enum Error {
     #[snafu(display("Could not canonicalize project directory `{}`: {source}", path.display()))]
     CanonicalizeProject { path: PathBuf, source: std::io::Error },
 
-    #[snafu(display("Refusing to run in forbidden directory `{}`", path.display()))]
+    #[snafu(display("Refusing to start in forbidden directory `{}`", path.display()))]
     ForbiddenDirectory { path: PathBuf },
+
+    #[snafu(display("Could not parse `{name}` as an agentbox container name"))]
+    ParseContainerName { name: String },
+
+    #[snafu(display("No agentbox-managed containers found; run `agentbox start` first"))]
+    NoManagedContainers,
+
+    #[snafu(display("Container `{name}` is not managed by agentbox"))]
+    ContainerNotFound { name: String },
+
+    #[snafu(display("Multiple containers available ({names}); pass --container NAME"))]
+    AmbiguousContainer { names: String },
+
+    #[snafu(display("Container selection cancelled"))]
+    ContainerPickerCancelled,
+
+    #[snafu(display("Could not determine the project directory of container `{name}`"))]
+    ProjectDirectoryNotFound { name: String },
+
+    #[snafu(display("--container is not supported with this command"))]
+    ContainerOptionUnsupported,
 
     #[snafu(display("Failed to run `{program}`: {source}"))]
     SpawnCommand { program: String, source: std::io::Error },

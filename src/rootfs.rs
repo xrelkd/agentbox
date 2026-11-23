@@ -16,6 +16,7 @@ use crate::{
 /// shell.
 pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) -> Result<String> {
     let home = &identity.host.home;
+    create_private_dir(&identity.runtime_dir)?;
     create_private_dir(&identity.meta_dir)?;
     create_private_dir(&identity.home_dir)?;
 
@@ -226,10 +227,11 @@ mod tests {
             name: "project".into(),
             hash: "deadbeef".into(),
             container_name: "agentbox-project-deadbeef".into(),
-            tmp_dir: root.join("tmp"),
-            home_dir: root.join("persistent-home"),
-            meta_dir: root.join("meta"),
-            rootfs_dir: root.join("meta/rootfs"),
+            runtime_dir: root.join("runtime"),
+            tmp_dir: root.join("runtime/tmp"),
+            home_dir: root.join("runtime/persistent-home"),
+            meta_dir: root.join("runtime/meta"),
+            rootfs_dir: root.join("runtime/meta/rootfs"),
             host: HostIdentity {
                 uid: 1000,
                 gid: 1000,

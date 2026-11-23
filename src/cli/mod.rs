@@ -28,7 +28,9 @@ use status::StatusArgs;
 use stop::StopArgs;
 use version::VersionArgs;
 
-use crate::{build::CLAP_LONG_VERSION, consts::CLI_PROGRAM_NAME, error::Result};
+use crate::{
+    app::TargetRequirement, build::CLAP_LONG_VERSION, consts::CLI_PROGRAM_NAME, error::Result,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,6 +47,10 @@ pub struct Cli {
     /// Increase logging verbosity (repeat for more detail).
     #[arg(short, long, global = true, action = ArgAction::Count)]
     pub verbose: u8,
+
+    /// Operate on a specific agentbox container instead of the current project.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub container: Option<String>,
 
     /// Command to run (defaults to `list`).
     #[command(subcommand)]
@@ -130,7 +136,26 @@ impl Cli {
         }
 
         let app = context.load_app()?;
-        match self.command_or_default() {
+        let command = self.command_or_default();
+        let requirement = match &command {
+            Command::Shell(_)
+            | Command::Agent(_)
+            | Command::Opencode(_)
+            | Command::Claude(_)
+            | Command::Gemini(_) => Some(TargetRequirement::Running),
+            Command::Stop(_) | Command::Status(_) | Command::Tmp(_) | Command::Home(_) => {
+                Some(TargetRequirement::Any)
+            }
+            _ => None,
+        };
+        if self.container.is_some() && requirement.is_none() {
+            return Err(crate::error::Error::ContainerOptionUnsupported);
+        }
+        let app = match requirement {
+            Some(requirement) => app.resolve_target(self.container.as_deref(), requirement)?,
+            None => app,
+        };
+        match command {
             Command::Start(args) => args.run(&app),
             Command::Stop(args) => args.run(&app),
             Command::List(args) => args.run(&app),

@@ -7,7 +7,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 use crate::{
     config::{self, Config},
@@ -49,6 +49,8 @@ pub struct ProjectIdentity {
     pub hash: String,
     /// Generated Podman container name.
     pub container_name: String,
+    /// Per-project runtime directory containing `home`, `tmp`, and `meta`.
+    pub runtime_dir: PathBuf,
     /// Host temporary directory mounted at `/tmp` in the container.
     pub tmp_dir: PathBuf,
     /// Host directory mounted as the persistent container home directory.
@@ -67,26 +69,28 @@ impl ProjectIdentity {
         let current = env::current_dir().context(error::CurrentDirectorySnafu)?;
         let canonical = fs::canonicalize(&current)
             .with_context(|_| error::CanonicalizeProjectSnafu { path: current.clone() })?;
+        Self::resolve_from(&canonical, home, config)
+    }
 
-        validate_forbidden_dir(&canonical, home, config)?;
-
+    /// Resolves an explicit project directory without applying start-time
+    /// restrictions.
+    pub fn resolve_from(project_dir: &Path, home: &Path, config: &Config) -> Result<Self> {
         let name = sanitize_project_name(
-            canonical.file_name().and_then(OsStr::to_str).unwrap_or("project"),
+            project_dir.file_name().and_then(OsStr::to_str).unwrap_or("project"),
         );
-        let hash = project_hash(&canonical);
-        let prefix = &config.general.container_prefix;
+        let hash = project_hash(project_dir);
         let base = config::expand_path(Path::new(&config.general.runtime_base_dir), home);
         let host = HostIdentity::detect(home.to_path_buf())?;
-        let container_name = format!("{prefix}-{name}-{hash}");
-        let tmp_dir = base.join(format!("{prefix}-tmp-{}-{name}-{hash}", host.uid));
-        let home_dir = base.join(format!("{prefix}-home-{}-{name}-{hash}", host.uid));
-        let meta_dir = base.join(format!("{prefix}-meta-{}-{name}-{hash}", host.uid));
+        let container_name = format!("{}-{}-{}", config.general.container_prefix, name, hash);
+        let (runtime_dir, home_dir, tmp_dir, meta_dir) =
+            runtime_directories(&base, host.uid, &name, &hash);
 
         Ok(Self {
-            project_dir: canonical,
+            project_dir: project_dir.to_path_buf(),
             name,
             hash,
             container_name,
+            runtime_dir,
             tmp_dir,
             home_dir,
             rootfs_dir: meta_dir.join("rootfs"),
@@ -94,6 +98,62 @@ impl ProjectIdentity {
             host,
         })
     }
+
+    /// Builds the identity of an existing container selected outside its
+    /// project directory.
+    pub fn from_container(
+        container_name: &str,
+        project_dir: PathBuf,
+        host: &HostIdentity,
+        home: &Path,
+        config: &Config,
+    ) -> Result<Self> {
+        let prefix = format!("{}-", config.general.container_prefix);
+        let suffix = container_name
+            .strip_prefix(&prefix)
+            .with_context(|| error::ParseContainerNameSnafu { name: container_name.to_owned() })?;
+        let (name, hash) = suffix
+            .rsplit_once('-')
+            .with_context(|| error::ParseContainerNameSnafu { name: container_name.to_owned() })?;
+        snafu::ensure!(
+            !name.is_empty()
+                && hash.len() == 8
+                && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            error::ParseContainerNameSnafu { name: container_name.to_owned() }
+        );
+
+        let base = config::expand_path(Path::new(&config.general.runtime_base_dir), home);
+        let (runtime_dir, home_dir, tmp_dir, meta_dir) =
+            runtime_directories(&base, host.uid, name, hash);
+
+        Ok(Self {
+            project_dir,
+            name: name.to_owned(),
+            hash: hash.to_owned(),
+            container_name: container_name.to_owned(),
+            runtime_dir,
+            tmp_dir,
+            home_dir,
+            rootfs_dir: meta_dir.join("rootfs"),
+            meta_dir,
+            host: host.clone(),
+        })
+    }
+}
+
+fn runtime_directories(
+    base: &Path,
+    uid: u32,
+    name: &str,
+    hash: &str,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let runtime_dir = base.join(format!("{uid}-{name}-{hash}"));
+    (
+        runtime_dir.clone(),
+        runtime_dir.join("home"),
+        runtime_dir.join("tmp"),
+        runtime_dir.join("meta"),
+    )
 }
 
 /// Computes the stable eight-character project hash from a canonical absolute
@@ -235,14 +295,17 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    #[test]
-    fn identity_fields_are_independent_of_cwd() {
-        let host = super::HostIdentity {
+    fn host_identity() -> super::HostIdentity {
+        super::HostIdentity {
             uid: 1000,
             gid: 1000,
             username: "tester".into(),
             home: PathBuf::from("/home/tester"),
-        };
+        }
+    }
+
+    #[test]
+    fn identity_fields_are_independent_of_cwd() {
         let project_dir = PathBuf::from("/work/my-project");
         let hash = project_hash(&project_dir);
 
@@ -251,18 +314,86 @@ mod tests {
             name: sanitize_project_name("my-project"),
             hash: hash.clone(),
             container_name: format!("agentbox-my-project-{hash}"),
-            tmp_dir: PathBuf::from("/tmp/agentbox-tmp-1000-my-project-hash"),
-            home_dir: PathBuf::from("/tmp/agentbox-home-1000-my-project-hash"),
-            meta_dir: PathBuf::from("/tmp/agentbox-meta-1000-my-project-hash"),
-            rootfs_dir: PathBuf::from("/tmp/agentbox-meta-1000-my-project-hash/rootfs"),
-            host,
+            runtime_dir: PathBuf::from("/tmp/agentbox/1000-my-project-hash"),
+            tmp_dir: PathBuf::from("/tmp/agentbox/1000-my-project-hash/tmp"),
+            home_dir: PathBuf::from("/tmp/agentbox/1000-my-project-hash/home"),
+            meta_dir: PathBuf::from("/tmp/agentbox/1000-my-project-hash/meta"),
+            rootfs_dir: PathBuf::from("/tmp/agentbox/1000-my-project-hash/meta/rootfs"),
+            host: host_identity(),
         };
 
         assert_eq!(identity.project_dir, project_dir);
         assert_eq!(identity.hash.len(), 8);
         assert!(identity.container_name.starts_with("agentbox-my-project-"));
-        assert!(identity.tmp_dir.to_string_lossy().starts_with("/tmp/agentbox-tmp-"));
-        assert!(identity.home_dir.to_string_lossy().starts_with("/tmp/agentbox-home-"));
-        assert!(identity.rootfs_dir.starts_with(&identity.meta_dir));
+        assert!(identity.runtime_dir.to_string_lossy().starts_with("/tmp/agentbox/1000-"));
+        assert_eq!(identity.tmp_dir, identity.runtime_dir.join("tmp"));
+        assert_eq!(identity.home_dir, identity.runtime_dir.join("home"));
+        assert_eq!(identity.meta_dir, identity.runtime_dir.join("meta"));
+        assert_eq!(identity.rootfs_dir, identity.meta_dir.join("rootfs"));
+    }
+
+    #[test]
+    fn resolve_from_groups_runtime_directories_without_forbidden_check() {
+        let mut config = Config::default();
+        config.general.forbidden_dirs = vec!["/tmp".into()];
+        let identity = ProjectIdentity::resolve_from(
+            Path::new("/tmp/work/my-project"),
+            Path::new("/home/tester"),
+            &config,
+        )
+        .expect("resolve forbidden directory for non-start commands");
+
+        assert_eq!(identity.name, "my-project");
+        assert_eq!(identity.hash, project_hash(Path::new("/tmp/work/my-project")));
+        assert_eq!(
+            identity.runtime_dir,
+            PathBuf::from(format!("/tmp/agentbox/1000-my-project-{}", identity.hash))
+        );
+        assert_eq!(identity.home_dir, identity.runtime_dir.join("home"));
+        assert_eq!(identity.tmp_dir, identity.runtime_dir.join("tmp"));
+        assert_eq!(identity.meta_dir, identity.runtime_dir.join("meta"));
+        assert_eq!(identity.rootfs_dir, identity.meta_dir.join("rootfs"));
+        assert_eq!(identity.container_name, format!("agentbox-my-project-{}", identity.hash));
+    }
+
+    #[test]
+    fn from_container_parses_managed_container_names() {
+        let config = Config::default();
+        let host = host_identity();
+        let identity = ProjectIdentity::from_container(
+            "agentbox-my-project-abcd1234",
+            PathBuf::from("/work/my-project"),
+            &host,
+            Path::new("/home/tester"),
+            &config,
+        )
+        .expect("parse container name");
+
+        assert_eq!(identity.name, "my-project");
+        assert_eq!(identity.hash, "abcd1234");
+        assert_eq!(identity.container_name, "agentbox-my-project-abcd1234");
+        assert_eq!(identity.runtime_dir, PathBuf::from("/tmp/agentbox/1000-my-project-abcd1234"));
+        assert_eq!(identity.project_dir, PathBuf::from("/work/my-project"));
+
+        assert!(
+            ProjectIdentity::from_container(
+                "other-project-abcd1234",
+                PathBuf::from("/work/other"),
+                &host,
+                Path::new("/home/tester"),
+                &config,
+            )
+            .is_err()
+        );
+        assert!(
+            ProjectIdentity::from_container(
+                "agentbox-my-project-bad",
+                PathBuf::from("/work/other"),
+                &host,
+                Path::new("/home/tester"),
+                &config,
+            )
+            .is_err()
+        );
     }
 }

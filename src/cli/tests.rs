@@ -117,6 +117,19 @@ fn parses_list_output_flags() {
 }
 
 #[test]
+fn parses_global_container_option() {
+    let cli = Cli::try_parse_from(["agentbox", "--container", "agentbox-demo-12345678", "oc"])
+        .expect("parse container option");
+    assert_eq!(cli.container.as_deref(), Some("agentbox-demo-12345678"));
+    assert!(matches!(command(&cli), Command::Opencode(_)));
+
+    let cli = Cli::try_parse_from(["agentbox", "stop", "--container", "agentbox-demo-12345678"])
+        .expect("parse container option after subcommand");
+    assert_eq!(cli.container.as_deref(), Some("agentbox-demo-12345678"));
+    assert!(matches!(command(&cli), Command::Stop(_)));
+}
+
+#[test]
 fn parses_status_command() {
     let cli = Cli::try_parse_from(["agentbox", "status"]).expect("parse status");
     assert!(matches!(

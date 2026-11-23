@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 
 use crate::error::{self, Result};
@@ -144,6 +144,14 @@ pub struct ContainerInfo {
     pub ports: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct InspectMount {
+    #[serde(rename = "Destination")]
+    destination: PathBuf,
+    #[serde(rename = "Source")]
+    source: PathBuf,
+}
+
 /// Type-safe description of a `podman run` invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[expect(clippy::struct_excessive_bools, reason = "container flags map directly to Podman options")]
@@ -258,6 +266,27 @@ impl PodmanClient {
             error::ParsePodmanOutputSnafu { output: "empty container status" }
         );
         Ok(ContainerStatus::from(status.as_str()))
+    }
+
+    /// Returns the host source of a bind mount inside a container.
+    pub fn container_mount_source(
+        &self,
+        name: &str,
+        destination: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let args = os_args(&["inspect", "--format", "{{json .Mounts}}", name]);
+        let output = self.run(&args, false)?;
+        let mounts =
+            serde_json::from_slice::<Option<Vec<InspectMount>>>(&output.stdout).map_err(|_| {
+                error::Error::ParsePodmanOutput {
+                    output: String::from_utf8_lossy(&output.stdout).into_owned(),
+                }
+            })?;
+        Ok(mounts
+            .unwrap_or_default()
+            .into_iter()
+            .find(|mount| mount.destination == destination)
+            .map(|mount| mount.source))
     }
 
     /// Starts a detached container from a validated specification.
@@ -746,7 +775,13 @@ fn command_failure(program: &str, output: &Output) -> error::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::{
+        env,
+        ffi::OsString,
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+    };
 
     use super::{
         ContainerSpec, ContainerStatus, ExecFlags, Mount, PodmanClient, TcpProbe, redact_args,
@@ -914,6 +949,39 @@ mod tests {
         assert_eq!(containers[0].created, "2 minutes ago");
         assert_eq!(containers[0].running_for, "2 minutes");
         assert_eq!(containers[0].ports, "127.0.0.1:39423->4096/tcp");
+
+        drop(fs::remove_dir_all(&directory));
+    }
+
+    #[test]
+    fn container_mount_source_reads_inspect_json() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-inspect-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let binary = directory.join("podman");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf '%s\\n' \
+             '[{\"Destination\":\"/workspace\",\"Source\":\"/work/project\"},{\"Destination\":\"/\
+             nix/store\",\"Source\":\"/nix/store\"}]'\n",
+        )
+        .expect("write fake podman");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("set executable");
+
+        let client = PodmanClient::new(binary.to_string_lossy().into_owned());
+        assert_eq!(
+            client
+                .container_mount_source("agentbox-demo", Path::new("/workspace"))
+                .expect("inspect mounts"),
+            Some(PathBuf::from("/work/project"))
+        );
+        assert_eq!(
+            client
+                .container_mount_source("agentbox-demo", Path::new("/missing"))
+                .expect("inspect mounts"),
+            None
+        );
 
         drop(fs::remove_dir_all(&directory));
     }

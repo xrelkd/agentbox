@@ -7,15 +7,33 @@ use skim::{
 
 use crate::error::{self, Result};
 
-struct StringItem(String);
+#[derive(Clone)]
+pub struct PickerItem {
+    label: String,
+    value: String,
+}
+
+impl PickerItem {
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { label: label.into(), value: value.into() }
+    }
+}
+
+struct StringItem(PickerItem);
 
 impl SkimItem for StringItem {
-    fn text(&self) -> Cow<'_, str> { Cow::Borrowed(&self.0) }
+    fn text(&self) -> Cow<'_, str> { Cow::Borrowed(&self.0.label) }
 
-    fn output(&self) -> Cow<'_, str> { Cow::Borrowed(&self.0) }
+    fn output(&self) -> Cow<'_, str> { Cow::Borrowed(&self.0.value) }
 }
 
 pub fn select(prompt: &str, items: &[String]) -> Result<Option<String>> {
+    let items =
+        items.iter().map(|item| PickerItem::new(item.clone(), item.clone())).collect::<Vec<_>>();
+    select_value(prompt, &items)
+}
+
+pub fn select_value(prompt: &str, items: &[PickerItem]) -> Result<Option<String>> {
     if items.is_empty() {
         return Err(error::Error::NoPickerCandidates);
     }
@@ -59,7 +77,9 @@ pub fn select_or_default(prompt: &str, items: &[String], default: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{select, select_or_default};
+    use skim::SkimItem;
+
+    use super::{PickerItem, StringItem, select, select_or_default};
     use crate::error::Error;
 
     #[test]
@@ -84,5 +104,12 @@ mod tests {
             select_or_default("Pick: ", &["only".into()], "default").expect("select"),
             "only"
         );
+    }
+
+    #[test]
+    fn picker_item_displays_label_but_returns_value() {
+        let item = StringItem(PickerItem::new("visible label", "selected-value"));
+        assert_eq!(item.text(), "visible label");
+        assert_eq!(item.output(), "selected-value");
     }
 }
