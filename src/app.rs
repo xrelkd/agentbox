@@ -11,7 +11,6 @@ use std::{
 use indicatif::ProgressBar;
 use snafu::{OptionExt, ResultExt};
 
-pub use crate::ui::report::{ContainerRow, ListReport, MountSummary, ProjectReport};
 use crate::{
     config::{self, AgentServe, Config},
     consts::{CONTAINER_LOOPBACK, OCELOT_CONFIG_PATH, SERVE_MARKER_PREFIX},
@@ -19,21 +18,17 @@ use crate::{
     error::{self, Result},
     ocelot,
     output::OutputFormat,
-    podman::{ContainerInfo, ContainerSpec, ContainerStatus, PodmanClient, TcpProbe, shell_quote},
+    podman::{ContainerSpec, ContainerStatus, PodmanClient, TcpProbe, shell_quote},
     rootfs,
     runtime::{InitMode, Runtime, init_script_for},
+    target::select_container,
     ui,
     workspace::{self, ProjectIdentity},
 };
-
-/// Required state of a container selected outside its project directory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TargetRequirement {
-    /// Accept managed containers in any state.
-    Any,
-    /// Accept only running managed containers.
-    Running,
-}
+pub use crate::{
+    target::TargetRequirement,
+    ui::report::{ContainerRow, ListReport, MountSummary, ProjectReport},
+};
 
 fn agent_candidates(config: &Config) -> Vec<String> {
     let mut names = config.agents.keys().cloned().collect::<Vec<_>>();
@@ -142,43 +137,9 @@ impl App {
         explicit: Option<&str>,
         requirement: TargetRequirement,
     ) -> Result<Self> {
-        let mut candidates = self
-            .podman
-            .list_containers(&self.config.general.container_prefix)?
-            .into_iter()
-            .filter(|info| {
-                requirement != TargetRequirement::Running || Self::container_is_running(info)
-            })
-            .collect::<Vec<_>>();
-        snafu::ensure!(!candidates.is_empty(), error::NoManagedContainersSnafu);
-
-        let selected = match explicit {
-            Some(name) => candidates
-                .into_iter()
-                .find(|info| info.name == name)
-                .with_context(|| error::ContainerNotFoundSnafu { name: name.to_owned() })?,
-            None if candidates.iter().any(|info| info.name == self.identity.container_name) => {
-                let current = self.identity.container_name.clone();
-                candidates
-                    .into_iter()
-                    .find(|info| info.name == current)
-                    .with_context(|| error::ContainerNotFoundSnafu { name: current })?
-            }
-            None => {
-                if candidates.len() == 1 {
-                    candidates.remove(0)
-                } else if !io::stdin().is_terminal() {
-                    let names = candidates
-                        .iter()
-                        .map(|info| info.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(error::Error::AmbiguousContainer { names });
-                } else {
-                    Self::pick_container(&candidates)?
-                }
-            }
-        };
+        let candidates = self.podman.list_containers(&self.config.general.container_prefix)?;
+        let selected =
+            select_container(candidates, explicit, &self.identity.container_name, requirement)?;
 
         let workdir = self.expand_config_path(&self.config.container.workdir);
         let project_dir =
@@ -193,28 +154,6 @@ impl App {
             &self.config,
         )?;
         Ok(Self::new(self.config.clone(), identity, self.home.clone(), self.config_path.clone()))
-    }
-
-    fn pick_container(candidates: &[ContainerInfo]) -> Result<ContainerInfo> {
-        let items = candidates
-            .iter()
-            .map(|info| {
-                let status = if info.status.is_empty() { &info.state } else { &info.status };
-                ui::fuzzy::PickerItem::new(format!("{}  [{status}]", info.name), info.name.clone())
-            })
-            .collect::<Vec<_>>();
-        let selected = ui::fuzzy::select_value("Container: ", &items)?
-            .with_context(|| error::ContainerPickerCancelledSnafu)?;
-        candidates
-            .iter()
-            .find(|info| info.name == selected)
-            .cloned()
-            .with_context(|| error::ContainerNotFoundSnafu { name: selected })
-    }
-
-    fn container_is_running(info: &ContainerInfo) -> bool {
-        ContainerStatus::from(info.state.as_str()).is_running()
-            || info.status.to_ascii_lowercase().starts_with("up")
     }
 
     fn project_report(&self, rows: &[ContainerRow]) -> ProjectReport {
@@ -594,14 +533,7 @@ impl App {
         let secrets_base = self.expand_config_path(&self.config.secrets.base_dir);
         let mut content = String::new();
         for (key, relative) in &self.config.secrets.entries {
-            snafu::ensure!(
-                !key.is_empty()
-                    && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                error::InvalidConfigSnafu {
-                    message: format!("secrets.entries key `{key}` is not a valid env name")
-                }
-            );
+            config::validate_secret_key(key)?;
             let secret_path = secrets_base.join(relative);
             let Ok(value) = fs::read_to_string(&secret_path) else {
                 tracing::debug!("Skipping unreadable secret {}", secret_path.display());

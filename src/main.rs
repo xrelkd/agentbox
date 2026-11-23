@@ -9,6 +9,7 @@ mod output;
 mod podman;
 mod rootfs;
 mod runtime;
+mod target;
 mod ui;
 mod workspace;
 

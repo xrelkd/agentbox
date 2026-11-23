@@ -28,7 +28,7 @@ pub fn render_list(rows: &[ContainerRow], project: &ProjectReport) -> String {
     output.push_str("\nCURRENT PROJECT\n");
     output.push_str(&render_rows(&[
         ("Dir", project.dir.clone()),
-        ("Container", format!("{} ({})", project.container, state_label(project))),
+        ("Container", container_label(project)),
         ("Home", project.home.clone()),
         ("Tmp", project.tmp.clone()),
     ]));
@@ -41,7 +41,7 @@ pub fn render_status(project: &ProjectReport) -> String {
         ("Dir", project.dir.clone()),
         ("Name", project.name.clone()),
         ("Hash", project.hash.clone()),
-        ("Container", format!("{} ({})", project.container, state_label(project))),
+        ("Container", container_label(project)),
         ("Hostname", project.hostname.clone()),
         ("Home", project.home.clone()),
         ("Tmp", project.tmp.clone()),
@@ -93,6 +93,10 @@ fn render_rows(rows: &[(&str, String)]) -> String {
         let _ = column.set_padding((0, 0));
     }
     table.to_string()
+}
+
+fn container_label(project: &ProjectReport) -> String {
+    format!("{} ({})", project.container, state_label(project))
 }
 
 fn state_label(project: &ProjectReport) -> String {

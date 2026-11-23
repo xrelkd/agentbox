@@ -525,6 +525,9 @@ impl Config {
             }
             validate_command(&agent.command, &format!("agents.{name}.command"))?;
         }
+        for key in self.secrets.entries.keys() {
+            validate_secret_key(key)?;
+        }
         Ok(())
     }
 }
@@ -548,6 +551,19 @@ fn validate_command(command: &str, field: &str) -> Result<()> {
     snafu::ensure!(
         !words.is_empty(),
         error::InvalidConfigSnafu { message: format!("{field} must not be empty") }
+    );
+    Ok(())
+}
+
+/// Validates a secret environment variable name.
+pub fn validate_secret_key(key: &str) -> Result<()> {
+    snafu::ensure!(
+        !key.is_empty()
+            && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        error::InvalidConfigSnafu {
+            message: format!("secrets.entries key `{key}` is not a valid env name")
+        }
     );
     Ok(())
 }
@@ -777,5 +793,19 @@ general:
             .expect("opencode serve");
         serve.command = "\t ".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_secret_key() {
+        let mut config = Config::default();
+        assert!(config.secrets.entries.insert("1invalid".into(), "secret".into()).is_none());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_secret_key() {
+        let mut config = Config::default();
+        assert!(config.secrets.entries.insert("_VALID1".into(), "secret".into()).is_none());
+        assert!(config.validate().is_ok());
     }
 }
