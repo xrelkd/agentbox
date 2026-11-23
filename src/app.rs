@@ -10,12 +10,14 @@ use std::{
     time::Duration,
 };
 
+use indicatif::ProgressBar;
 use serde::Serialize;
 use snafu::{OptionExt, ResultExt};
 
 use crate::{
     cli::OutputFormat,
     config::{self, AgentServe, Config},
+    consts::{CONTAINER_LOOPBACK, OCELOT_CONFIG_PATH, SERVE_MARKER_PREFIX},
     error::{self, Result},
     ocelot,
     podman::{
@@ -25,10 +27,6 @@ use crate::{
     rootfs, ui,
     workspace::ProjectIdentity,
 };
-
-const OCELOT_CONFIG_PATH: &str = "/etc/agentbox/ocelot.yaml";
-const SERVE_MARKER_PREFIX: &str = "/var/tmp/agentbox-serve-";
-const CONTAINER_LOOPBACK: &str = "localhost";
 
 /// Init strategy selected for a container.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,13 +304,13 @@ impl App {
 
     fn resolve_agent_name(&self) -> Result<String> {
         let candidates = agent_candidates(&self.config);
-        if std::io::stdin().is_terminal()
-            && candidates.len() > 1
-            && let Some(selected) = ui::fuzzy::select("Agent: ", &candidates)?
-        {
-            return Ok(selected);
-        }
-        Ok(self.config.general.default_agent.clone())
+        ui::fuzzy::select_or_default("Agent: ", &candidates, &self.config.general.default_agent)
+    }
+
+    /// Prints the agent selected by the default chain or interactive picker.
+    pub fn print_agent_choice(&self) -> Result<()> {
+        println!("{}", self.resolve_agent_name()?);
+        Ok(())
     }
 
     /// Attaches to an agent by name, using its server when one is configured.
@@ -376,8 +374,21 @@ impl App {
             timeout: Duration::from_secs(self.config.server.startup_timeout_secs),
             interval: Duration::from_millis(self.config.server.poll_interval_ms),
         };
-        tracing::info!("Waiting for {agent_name} server in {name} to be ready...");
-        self.podman.wait_for_tcp_ready(name, &probe)
+        let spinner = std::io::stderr().is_terminal().then(|| {
+            let bar = ProgressBar::new_spinner();
+            bar.set_message(format!("Waiting for {agent_name} server in {name}..."));
+            bar.enable_steady_tick(Duration::from_millis(100));
+            bar
+        });
+        let result = self.podman.wait_for_tcp_ready(name, &probe);
+        if let Some(bar) = spinner {
+            if result.is_ok() {
+                bar.finish_with_message(format!("{agent_name} server in {name} ready"));
+            } else {
+                bar.finish_and_clear();
+            }
+        }
+        result
     }
 
     fn require_running_container(&self) -> Result<Runtime> {
@@ -829,6 +840,11 @@ mod tests {
     #[test]
     fn agent_candidates_include_shell_and_are_sorted() {
         assert_eq!(agent_candidates(&Config::default()), ["claude", "gemini", "opencode", "shell"]);
+    }
+
+    #[test]
+    fn agent_choice_uses_default_without_tty() {
+        assert_eq!(app().resolve_agent_name().expect("resolve agent"), "shell");
     }
 
     #[test]

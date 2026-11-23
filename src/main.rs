@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod config;
+mod consts;
 mod error;
 mod ocelot;
 mod podman;
@@ -14,6 +15,11 @@ use clap::Parser;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::cli::Cli;
+
+#[expect(dead_code, reason = "shadow-rs emits a superset of build metadata")]
+mod build {
+    include!(concat!(env!("OUT_DIR"), "/shadow.rs"));
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();

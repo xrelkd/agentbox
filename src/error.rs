@@ -90,6 +90,9 @@ pub enum Error {
     #[snafu(display("Could not run the interactive picker: {message}"))]
     RunFuzzyFinder { message: String },
 
+    #[snafu(display("No candidates available for the interactive picker"))]
+    NoPickerCandidates,
+
     #[snafu(display("Agent `{name}` has no server command configured"))]
     AgentHasNoServe { name: String },
 

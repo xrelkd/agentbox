@@ -16,7 +16,10 @@ impl SkimItem for StringItem {
 }
 
 pub fn select(prompt: &str, items: &[String]) -> Result<Option<String>> {
-    if !std::io::stdin().is_terminal() || items.len() <= 1 {
+    if items.is_empty() {
+        return Err(error::Error::NoPickerCandidates);
+    }
+    if !std::io::stdin().is_terminal() || items.len() == 1 {
         return Ok(None);
     }
 
@@ -42,4 +45,44 @@ pub fn select(prompt: &str, items: &[String]) -> Result<Option<String>> {
     }
 
     Ok(output.selected_items.first().map(|item| item.output().into_owned()))
+}
+
+pub fn select_or_default(prompt: &str, items: &[String], default: &str) -> Result<String> {
+    if items.is_empty() {
+        return Err(error::Error::NoPickerCandidates);
+    }
+    if items.len() == 1 {
+        return Ok(items[0].clone());
+    }
+    Ok(select(prompt, items)?.unwrap_or_else(|| default.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select, select_or_default};
+    use crate::error::Error;
+
+    #[test]
+    fn select_rejects_empty_candidates() {
+        assert!(matches!(select("Pick: ", &[]), Err(Error::NoPickerCandidates)));
+    }
+
+    #[test]
+    fn select_skips_picker_for_single_candidate() {
+        assert_eq!(select("Pick: ", &["only".into()]).expect("select"), None);
+    }
+
+    #[test]
+    fn select_or_default_uses_default_without_tty() {
+        let items = vec!["alpha".into(), "beta".into()];
+        assert_eq!(select_or_default("Pick: ", &items, "beta").expect("select"), "beta");
+    }
+
+    #[test]
+    fn select_or_default_prefers_the_only_candidate() {
+        assert_eq!(
+            select_or_default("Pick: ", &["only".into()], "default").expect("select"),
+            "only"
+        );
+    }
 }
