@@ -1,10 +1,9 @@
 use clap::{Args, CommandFactory};
 use clap_complete::{Shell, generate};
 
-use super::Cli;
-use crate::consts::CLI_PROGRAM_NAME;
+use crate::{cli::Cli, consts::CLI_PROGRAM_NAME};
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct CompletionsArgs {
     /// Shell to generate completions for.
     pub shell: Shell,

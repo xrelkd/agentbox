@@ -2,7 +2,7 @@ use clap::Args;
 
 use crate::{app::App, error::Result};
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct StartArgs {
     /// Attach to the server after creating the session.
     #[arg(long)]

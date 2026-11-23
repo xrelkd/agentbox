@@ -2,22 +2,22 @@ use clap::Args;
 
 use crate::{app::App, error::Result};
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct AgentArgs {
     /// Configured agent name (`general.default_agent` when omitted).
     pub name: Option<String>,
 }
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct PickArgs {}
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct OpencodeArgs {}
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct ClaudeArgs {}
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct GeminiArgs {}
 
 impl AgentArgs {

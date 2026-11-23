@@ -631,42 +631,44 @@ impl App {
         let (ocelot, _) = rootfs::resolve_tool(&config.general.ocelot_path, ai_env_path);
         let init_script = init_script_for(&init_shell, mode, &ocelot);
 
-        let mut builder = ContainerSpec::builder(identity.container_name.clone())
-            .hostname(format!("{}-{}", config.container.hostname_prefix, identity.name))
-            .workdir(workdir)
-            .user(identity.host.uid, identity.host.gid)
-            .rootfs(identity.rootfs_dir.clone())
-            .rootfs_overlay(config.container.rootfs_overlay)
-            .init_shell(init_shell)
-            .init_script(init_script)
-            .init(mode == InitMode::Fallback)
-            .read_only(config.container.read_only)
-            .no_new_privileges(config.container.no_new_privileges)
-            .drop_all_caps(config.container.drop_all_caps)
-            .pids_limit(config.container.pids_limit)
-            .memory_limit(config.container.memory_limit.clone())
-            .inherit_proxy(config.container.inherit_proxy);
-        if let Some(limit) = &config.container.memory_swap {
-            builder = builder.memory_swap(limit);
-        }
-        if let Some(cpus) = &config.container.cpus {
-            builder = builder.cpus(cpus);
-        }
-        for (name, value) in &config.container.ulimits {
-            builder = builder.ulimit(name, value);
-        }
+        {
+            let mut builder = ContainerSpec::builder(identity.container_name.clone())
+                .hostname(format!("{}-{}", config.container.hostname_prefix, identity.name))
+                .workdir(workdir)
+                .user(identity.host.uid, identity.host.gid)
+                .rootfs(identity.rootfs_dir.clone())
+                .rootfs_overlay(config.container.rootfs_overlay)
+                .init_shell(init_shell)
+                .init_script(init_script)
+                .init(mode == InitMode::Fallback)
+                .read_only(config.container.read_only)
+                .no_new_privileges(config.container.no_new_privileges)
+                .drop_all_caps(config.container.drop_all_caps)
+                .pids_limit(config.container.pids_limit)
+                .memory_limit(config.container.memory_limit.clone())
+                .inherit_proxy(config.container.inherit_proxy);
+            if let Some(limit) = &config.container.memory_swap {
+                builder = builder.memory_swap(limit);
+            }
+            if let Some(cpus) = &config.container.cpus {
+                builder = builder.cpus(cpus);
+            }
+            for (name, value) in &config.container.ulimits {
+                builder = builder.ulimit(name, value);
+            }
 
-        for mount in self.build_mounts(ai_env_path) {
-            builder = builder.mount(mount);
+            for mount in self.build_mounts(ai_env_path) {
+                builder = builder.mount(mount);
+            }
+            for tmpfs in self.build_tmpfs() {
+                builder = builder.tmpfs(tmpfs);
+            }
+            for (key, value) in self.build_env(self.shell()) {
+                builder = builder.env(key, value);
+            }
+            builder = builder.env_file(self.write_secret_env_file()?);
+            builder.build()
         }
-        for tmpfs in self.build_tmpfs() {
-            builder = builder.tmpfs(tmpfs);
-        }
-        for (key, value) in self.build_env(self.shell()) {
-            builder = builder.env(key, value);
-        }
-        builder = builder.env_file(self.write_secret_env_file()?);
-        builder.build()
     }
 
     fn build_mounts(&self, ai_env_path: &Path) -> Vec<Mount> {
@@ -803,9 +805,13 @@ impl App {
             env::var("TERM").unwrap_or_else(|_| config.environment.default_term.clone()),
         );
 
-        for (key, value) in &config.environment.extra_env {
-            variables.push((key.clone(), self.expand_config_value(value)));
-        }
+        variables.extend(
+            config
+                .environment
+                .extra_env
+                .iter()
+                .map(|(key, value)| (key.clone(), self.expand_config_value(value))),
+        );
 
         variables
     }

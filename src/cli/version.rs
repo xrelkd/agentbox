@@ -2,7 +2,7 @@ use clap::Args;
 
 use crate::build;
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct VersionArgs {
     /// Print only client build metadata.
     #[arg(long)]

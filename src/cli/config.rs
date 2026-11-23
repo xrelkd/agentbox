@@ -2,13 +2,13 @@ use std::io::Write;
 
 use clap::{Args, Subcommand};
 
-use super::{error::Error, internal::context::AppContext};
 use crate::{
+    cli::{error::Error, internal::context::AppContext},
     config::{Config, DEFAULT_CONFIG_TEMPLATE, FULL_CONFIG_TEMPLATE},
     error::Result,
 };
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct ConfigArgs {
     #[command(subcommand)]
     pub action: ConfigAction,

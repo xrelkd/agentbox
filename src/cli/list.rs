@@ -2,7 +2,7 @@ use clap::{Args, ValueEnum};
 
 use crate::{app::App, error::Result};
 
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct ListArgs {
     /// Emit JSON instead of a table.
     #[arg(long, value_enum)]

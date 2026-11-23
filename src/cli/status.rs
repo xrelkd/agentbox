@@ -1,9 +1,8 @@
 use clap::Args;
 
-use super::list::OutputFormat;
-use crate::{app::App, error::Result};
+use crate::{app::App, cli::list::OutputFormat, error::Result};
 
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct StatusArgs {
     /// Emit JSON instead of a key/value report.
     #[arg(long, value_enum)]

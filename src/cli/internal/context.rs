@@ -3,8 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::super::error::Error;
-use crate::{app::App, config::Config, error::Result, workspace::ProjectIdentity};
+use crate::{
+    app::App, cli::error::Error, config::Config, error::Result, workspace::ProjectIdentity,
+};
 
 pub struct AppContext {
     pub home: PathBuf,

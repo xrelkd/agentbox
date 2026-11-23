@@ -2,7 +2,7 @@ use clap::Args;
 
 use crate::{app::App, error::Result};
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct StopArgs {
     /// Remove container-created home data before stopping.
     #[arg(long)]

@@ -2,13 +2,13 @@ use clap::Args;
 
 use crate::{app::App, error::Result};
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct ShellArgs {}
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct TmpArgs {}
 
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Args)]
 pub struct HomeArgs {}
 
 impl ShellArgs {

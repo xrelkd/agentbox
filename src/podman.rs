@@ -431,19 +431,20 @@ impl PodmanClient {
         workdir: Option<&Path>,
         flags: ExecFlags,
     ) -> Vec<OsString> {
-        let mut args = vec![OsString::from("exec")];
-        match flags {
-            ExecFlags::Plain => {}
-            ExecFlags::Interactive => args.push(OsString::from("-it")),
-            ExecFlags::Detached => args.push(OsString::from("-d")),
-        }
-        if let Some(directory) = workdir {
-            args.push(OsString::from("-w"));
-            args.push(directory.as_os_str().to_os_string());
-        }
-        args.push(OsString::from(name));
-        args.extend(command.iter().map(OsString::from));
-        args
+        std::iter::once(OsString::from("exec"))
+            .chain(match flags {
+                ExecFlags::Plain => None,
+                ExecFlags::Interactive => Some(OsString::from("-it")),
+                ExecFlags::Detached => Some(OsString::from("-d")),
+            })
+            .chain(
+                workdir.into_iter().flat_map(|directory| {
+                    [OsString::from("-w"), directory.as_os_str().to_os_string()]
+                }),
+            )
+            .chain(std::iter::once(OsString::from(name)))
+            .chain(command.iter().map(OsString::from))
+            .collect()
     }
 
     fn run(&self, args: &[OsString], allow_failure: bool) -> Result<Output> {
@@ -503,22 +504,19 @@ impl ContainerSpec {
         if let Some(cpus) = &self.cpus {
             args.push(OsString::from(format!("--cpus={cpus}")));
         }
-        for (name, value) in &self.ulimits {
-            args.push(OsString::from(format!("--ulimit={name}={value}")));
-        }
+        args.extend(
+            self.ulimits
+                .iter()
+                .map(|(name, value)| OsString::from(format!("--ulimit={name}={value}"))),
+        );
         args.push(OsString::from(format!("--http-proxy={}", self.inherit_proxy)));
-        for mount in &self.mounts {
-            args.push(OsString::from("-v"));
-            args.push(mount.to_arg());
-        }
-        for tmpfs in &self.tmpfs {
-            args.push(OsString::from("--tmpfs"));
-            args.push(tmpfs.to_arg());
-        }
-        for (key, value) in &self.env {
-            args.push(OsString::from("-e"));
-            args.push(OsString::from(format!("{key}={value}")));
-        }
+        args.extend(self.mounts.iter().flat_map(|mount| [OsString::from("-v"), mount.to_arg()]));
+        args.extend(
+            self.tmpfs.iter().flat_map(|tmpfs| [OsString::from("--tmpfs"), tmpfs.to_arg()]),
+        );
+        args.extend(self.env.iter().flat_map(|(key, value)| {
+            [OsString::from("-e"), OsString::from(format!("{key}={value}"))]
+        }));
         if let Some(path) = &self.env_file {
             args.push(OsString::from("--env-file"));
             args.push(path.as_os_str().to_os_string());
