@@ -2,14 +2,12 @@ mod app;
 mod cli;
 mod config;
 mod consts;
-mod container_plan;
 mod error;
-mod ocelot;
 mod output;
 mod podman;
 mod rootfs;
-mod runtime;
-mod target;
+mod session;
+mod shell;
 mod ui;
 mod workspace;
 

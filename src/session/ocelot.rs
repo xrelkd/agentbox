@@ -137,3 +137,35 @@ pub fn render_config(config: &Config, ocelot_path: &str) -> Result<String> {
 
     serde_yaml::to_string(&supervise).context(error::SerializeOcelotConfigSnafu)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render_config;
+    use crate::config::Config;
+
+    #[test]
+    fn rendered_ocelot_config_uses_generic_server_settings() {
+        let yaml =
+            render_config(&Config::default(), "/run/ai-env/bin/ocelot").expect("ocelot config");
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse ocelot config");
+        let opencode = &value["processes"]["opencode"];
+        let arguments = opencode["arguments"].as_sequence().expect("arguments");
+
+        assert_eq!(value["version"].as_str(), Some("1.0"));
+        assert_eq!(
+            value["processes"]["keeper"]["program"].as_str(),
+            Some("/run/ai-env/bin/ocelot")
+        );
+        assert_eq!(value["processes"]["keeper"]["arguments"][0].as_str(), Some("idle"));
+        assert_eq!(opencode["program"].as_str(), Some("opencode"));
+        assert_eq!(opencode["workingDirectory"].as_str(), Some("/workspace"));
+        assert_eq!(opencode["readinessProbe"]["handler"]["type"].as_str(), Some("tcpSocket"));
+        assert_eq!(opencode["readinessProbe"]["handler"]["host"].as_str(), Some("127.0.0.1"));
+        assert_eq!(opencode["readinessProbe"]["handler"]["port"].as_u64(), Some(4096));
+        assert_eq!(opencode["dependsOn"]["keeper"]["condition"].as_str(), Some("Started"));
+        assert!(arguments.iter().any(|argument| argument.as_str() == Some("--port")));
+        assert!(arguments.iter().any(|argument| argument.as_str() == Some("4096")));
+        assert!(arguments.iter().any(|argument| argument.as_str() == Some("--hostname")));
+        assert!(arguments.iter().any(|argument| argument.as_str() == Some("127.0.0.1")));
+    }
+}

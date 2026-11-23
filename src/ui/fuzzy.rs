@@ -27,7 +27,7 @@ impl SkimItem for StringItem {
     fn output(&self) -> Cow<'_, str> { Cow::Borrowed(&self.0.value) }
 }
 
-pub fn select(prompt: &str, items: &[String]) -> Result<Option<String>> {
+fn select(prompt: &str, items: &[String]) -> Result<Option<String>> {
     let items =
         items.iter().map(|item| PickerItem::new(item.clone(), item.clone())).collect::<Vec<_>>();
     select_value(prompt, &items)

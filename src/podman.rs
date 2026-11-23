@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
     fmt,
+    io::ErrorKind,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -9,9 +10,12 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt};
+use snafu::OptionExt;
 
-use crate::error::{self, Result};
+use crate::{
+    error::{self, Result},
+    shell::shell_quote,
+};
 
 /// Host-to-container bind mount.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -383,7 +387,7 @@ impl PodmanClient {
     }
 
     /// Returns combined container logs, tolerating a missing container.
-    pub fn logs(&self, name: &str) -> Result<String> {
+    fn logs(&self, name: &str) -> Result<String> {
         let args = os_args(&["logs", name]);
         let output = self.run(&args, true)?;
         let mut logs = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -448,15 +452,31 @@ impl PodmanClient {
     }
 
     fn run(&self, args: &[OsString], allow_failure: bool) -> Result<Output> {
+        const ATTEMPTS: u32 = 10;
         tracing::debug!("Running podman {}", redact_args(args));
-        let output = Command::new(&self.binary)
-            .args(args)
-            .output()
-            .with_context(|_| error::SpawnCommandSnafu { program: self.binary.clone() })?;
-        if !allow_failure && !output.status.success() {
-            return Err(command_failure(&self.binary, &output));
+        let mut attempt = 0;
+        loop {
+            match Command::new(&self.binary).args(args).output() {
+                Ok(output) => {
+                    if !allow_failure && !output.status.success() {
+                        return Err(command_failure(&self.binary, &output));
+                    }
+                    return Ok(output);
+                }
+                Err(source)
+                    if source.kind() == ErrorKind::ExecutableFileBusy && attempt + 1 < ATTEMPTS =>
+                {
+                    attempt += 1;
+                    thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+                }
+                Err(source) => {
+                    return Err(error::Error::SpawnCommand {
+                        program: self.binary.clone(),
+                        source,
+                    });
+                }
+            }
         }
-        Ok(output)
     }
 }
 
@@ -750,10 +770,6 @@ impl ContainerSpecBuilder {
     }
 }
 
-/// Quotes a value for safe use in a POSIX shell command.
-#[inline]
-pub fn shell_quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
-
 #[inline]
 fn os_args(arguments: &[&str]) -> Vec<OsString> { arguments.iter().map(OsString::from).collect() }
 
@@ -779,13 +795,14 @@ mod tests {
         fs,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        thread,
+        time::Duration,
     };
 
     use super::{
         ContainerSpec, ContainerStatus, ExecFlags, Mount, PodmanClient, TcpProbe, redact_args,
-        shell_quote,
     };
-    use crate::error::Error;
+    use crate::{error::Error, shell::shell_quote};
 
     fn minimal_spec() -> ContainerSpec {
         ContainerSpec::builder("agentbox-test")
@@ -915,8 +932,8 @@ mod tests {
             shell: "/bin/sh".into(),
             host: "127.0.0.1".into(),
             port: 4096,
-            timeout: std::time::Duration::from_secs(15),
-            interval: std::time::Duration::from_millis(250),
+            timeout: Duration::from_secs(15),
+            interval: Duration::from_millis(250),
         };
         assert_eq!(probe.script(), "exec 3<>/dev/tcp/'127.0.0.1'/4096");
     }
@@ -947,6 +964,35 @@ mod tests {
         assert_eq!(containers[0].created, "2 minutes ago");
         assert_eq!(containers[0].running_for, "2 minutes");
         assert_eq!(containers[0].ports, "127.0.0.1:39423->4096/tcp");
+
+        drop(fs::remove_dir_all(&directory));
+    }
+
+    #[test]
+    fn list_containers_retries_executable_file_busy() {
+        let directory =
+            env::temp_dir().join(format!("agentbox-podman-retry-test-{}", std::process::id()));
+        drop(fs::remove_dir_all(&directory));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let binary = directory.join("podman");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'abc123\\tagentbox-demo\\tUp 2 minutes\\trunning\\t0\\t2 minutes \
+             ago\\t2 minutes\\t127.0.0.1:39423->4096/tcp\\n'\n",
+        )
+        .expect("write fake podman");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("set executable");
+
+        let holder = fs::OpenOptions::new().write(true).open(&binary).expect("hold writable");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            drop(holder);
+        });
+
+        let client = PodmanClient::new(binary.to_string_lossy().into_owned());
+        let containers = client.list_containers("agentbox").expect("list");
+        release.join().expect("release fake podman");
+        assert_eq!(containers.len(), 1);
 
         drop(fs::remove_dir_all(&directory));
     }

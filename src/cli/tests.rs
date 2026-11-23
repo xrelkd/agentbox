@@ -3,7 +3,8 @@ use std::{ffi::OsStr, path::PathBuf};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 
-use super::{Cli, Command, OutputFormat, config::ConfigAction};
+use super::{Cli, Command, config::ConfigAction};
+use crate::output::OutputFormat;
 
 fn command(cli: &Cli) -> Command { cli.command_or_default() }
 

@@ -3,7 +3,7 @@ use std::io::Write;
 use clap::{Args, Subcommand};
 
 use crate::{
-    cli::internal::context::AppContext,
+    cli::context::AppContext,
     config::{Config, DEFAULT_CONFIG_TEMPLATE, FULL_CONFIG_TEMPLATE},
     error::{Error, Result},
 };

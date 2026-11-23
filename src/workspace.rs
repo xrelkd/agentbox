@@ -30,7 +30,7 @@ pub struct HostIdentity {
 impl HostIdentity {
     /// Detects uid, gid, and username via `id`, using the supplied home
     /// directory.
-    pub fn detect(home: PathBuf) -> Result<Self> {
+    fn detect(home: PathBuf) -> Result<Self> {
         let uid = parse_id(&id_output("-u")?, "uid")?;
         let gid = parse_id(&id_output("-g")?, "gid")?;
         let username = id_output("-un")?;
@@ -104,7 +104,7 @@ impl ProjectIdentity {
 
     /// Resolves an explicit project directory without applying start-time
     /// restrictions.
-    pub fn resolve_from(project_dir: &Path, home: &Path, config: &Config) -> Result<Self> {
+    fn resolve_from(project_dir: &Path, home: &Path, config: &Config) -> Result<Self> {
         let name = sanitize_project_name(
             project_dir.file_name().and_then(OsStr::to_str).unwrap_or("project"),
         );

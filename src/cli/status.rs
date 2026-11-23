@@ -1,6 +1,6 @@
 use clap::Args;
 
-use crate::{app::App, cli::OutputFormat, error::Result};
+use crate::{app::App, error::Result, output::OutputFormat};
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct StatusArgs {

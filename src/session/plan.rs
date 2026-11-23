@@ -216,3 +216,114 @@ fn kernel_release() -> Option<String> {
     let release = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if release.is_empty() { None } else { Some(release) }
 }
+#[cfg(test)]
+mod tests {
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+    };
+
+    use super::ContainerPlan;
+    use crate::{
+        config::{Config, MountEntry},
+        workspace::{HostIdentity, ProjectIdentity},
+    };
+
+    fn identity() -> ProjectIdentity {
+        let home = PathBuf::from("/home/tester");
+        ProjectIdentity {
+            project_dir: PathBuf::from("/work/project"),
+            name: "project".into(),
+            hash: "deadbeef".into(),
+            container_name: "agentbox-project-deadbeef".into(),
+            runtime_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef"),
+            tmp_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/tmp"),
+            home_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/home"),
+            meta_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/meta"),
+            rootfs_dir: PathBuf::from("/tmp/agentbox/1000-project-deadbeef/meta/rootfs"),
+            host: HostIdentity { uid: 1000, gid: 1000, username: "tester".into(), home },
+        }
+    }
+
+    fn plan(config: &Config, home: &Path, ai_env_path: &Path) -> ContainerPlan {
+        ContainerPlan::new(config, &identity(), home, ai_env_path, "zsh")
+    }
+
+    #[test]
+    fn home_mount_precedes_nested_state_mounts() {
+        let home = PathBuf::from("/home/tester");
+        let temp = env::temp_dir();
+        let config = Config {
+            mounts: vec![MountEntry::new(temp.to_string_lossy(), "/home/tester/.agents", true)],
+            ..Default::default()
+        };
+        let plan = plan(&config, &home, Path::new("/nix/store/ai-env"));
+        let mounts = plan.mounts();
+        let home_index =
+            mounts.iter().position(|mount| mount.container == home).expect("home mount");
+        let agents_index = mounts
+            .iter()
+            .position(|mount| mount.container == home.join(".agents"))
+            .expect("state mount");
+
+        assert_eq!(mounts[home_index].host, identity().home_dir);
+        assert!(home_index < agents_index);
+    }
+
+    #[test]
+    fn missing_mount_source_is_skipped() {
+        let home = PathBuf::from("/home/tester");
+        let missing =
+            env::temp_dir().join(format!("agentbox-missing-mount-{}", std::process::id()));
+        drop(fs::remove_dir_all(&missing));
+        let temp = env::temp_dir();
+        let config = Config {
+            mounts: vec![
+                MountEntry::new(missing.to_string_lossy(), "/home/tester/missing", false),
+                MountEntry::new(temp.to_string_lossy(), "/home/tester/present", true),
+            ],
+            ..Default::default()
+        };
+
+        let plan = plan(&config, &home, Path::new("/nix/store/ai-env"));
+        let mounts = plan.mounts();
+        assert!(!mounts.iter().any(|mount| mount.container == home.join("missing")));
+        assert!(mounts.iter().any(|mount| mount.container == home.join("present")));
+    }
+
+    #[test]
+    fn temporary_directories_are_sized_tmpfs_mounts() {
+        let plan =
+            plan(&Config::default(), Path::new("/home/tester"), Path::new("/nix/store/ai-env"));
+        let tmpfs = plan.tmpfs();
+        assert_eq!(tmpfs.len(), 2);
+        assert_eq!(tmpfs[0].target, PathBuf::from("/tmp"));
+        assert_eq!(tmpfs[0].options, "rw,nosuid,nodev,mode=1777,size=2g");
+        assert_eq!(tmpfs[1].target, PathBuf::from("/var/tmp"));
+        assert_eq!(tmpfs[1].options, "rw,nosuid,nodev,noexec,mode=1777,size=2g");
+    }
+
+    #[test]
+    fn configuration_directories_are_mounted_read_only() {
+        let home = PathBuf::from("/home/tester");
+        let temp = env::temp_dir();
+        let config = Config {
+            mounts: vec![MountEntry::new(temp.to_string_lossy(), "/home/tester/.claude", true)],
+            ..Default::default()
+        };
+        let plan = plan(&config, &home, Path::new("/nix/store/ai-env"));
+        let mounts = plan.mounts();
+        let config_mount = mounts
+            .iter()
+            .find(|mount| mount.container == Path::new("/home/tester/.claude"))
+            .expect("claude config mount");
+        assert!(config_mount.read_only);
+
+        let nix = mounts
+            .iter()
+            .find(|mount| mount.container == Path::new("/home/tester/.config/nix"))
+            .expect("nix config mount");
+        assert!(nix.read_only);
+        assert!(nix.host.starts_with(&identity().home_dir));
+    }
+}

@@ -1,7 +1,7 @@
 mod agent;
 mod completions;
 mod config;
-mod internal;
+mod context;
 mod list;
 mod shell;
 mod start;
@@ -20,7 +20,7 @@ use self::{
     agent::{AgentArgs, ClaudeArgs, GeminiArgs, OpencodeArgs, PickArgs},
     completions::CompletionsArgs,
     config::ConfigArgs,
-    internal::context::AppContext,
+    context::AppContext,
     list::ListArgs,
     shell::{HomeArgs, ShellArgs, TmpArgs},
     start::StartArgs,
@@ -28,12 +28,12 @@ use self::{
     stop::StopArgs,
     version::VersionArgs,
 };
-pub use crate::output::OutputFormat;
 use crate::{
-    app::{App, TargetRequirement},
+    app::App,
     build::CLAP_LONG_VERSION,
     consts::CLI_PROGRAM_NAME,
     error::{Error, Result},
+    session::TargetRequirement,
 };
 
 #[derive(Debug, Parser)]
