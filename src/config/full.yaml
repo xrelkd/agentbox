@@ -45,11 +45,11 @@ container:
   # Maximum number of processes allowed in the container.
   pids_limit: 1024
   # Container memory limit passed to Podman.
-  memory_limit: "12g"
+  memory_limit: "32g"
   # Container memory-plus-swap limit; null lets Podman pick its default.
   memory_swap: null
   # Container CPU quota; null disables the limit.
-  cpus: "2"
+  cpus: null
   # Additional container ulimits.
   ulimits:
     core: "0"

@@ -275,9 +275,9 @@ impl Default for ContainerConfig {
             no_new_privileges: true,
             drop_all_caps: true,
             pids_limit: 1024,
-            memory_limit: "12g".into(),
+            memory_limit: "32g".into(),
             memory_swap: None,
-            cpus: Some("2".into()),
+            cpus: None,
             ulimits: BTreeMap::from([
                 ("core".into(), "0".into()),
                 ("nofile".into(), "4096:8192".into()),

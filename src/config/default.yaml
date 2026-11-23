@@ -22,8 +22,8 @@ general:
 container:
   workdir: "/workspace"
   read_only: true
-  memory_limit: "12g"
-  cpus: "2"
+  memory_limit: "32g"
+  cpus: "8"
 
 nix:
   enable_daemon_mount: true
