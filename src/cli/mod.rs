@@ -1,7 +1,6 @@
 mod agent;
 mod completions;
 mod config;
-mod error;
 mod internal;
 mod list;
 mod shell;
@@ -21,15 +20,18 @@ use completions::CompletionsArgs;
 use config::ConfigArgs;
 use internal::context::AppContext;
 use list::ListArgs;
-pub use list::OutputFormat;
 use shell::{HomeArgs, ShellArgs, TmpArgs};
 use start::StartArgs;
 use status::StatusArgs;
 use stop::StopArgs;
 use version::VersionArgs;
 
+pub use crate::output::OutputFormat;
 use crate::{
-    app::TargetRequirement, build::CLAP_LONG_VERSION, consts::CLI_PROGRAM_NAME, error::Result,
+    app::{App, TargetRequirement},
+    build::CLAP_LONG_VERSION,
+    consts::CLI_PROGRAM_NAME,
+    error::{Error, Result},
 };
 
 #[derive(Debug, Parser)]
@@ -120,61 +122,69 @@ impl Cli {
     }
 
     pub fn run(&self) -> Result<()> {
-        if let Some(Command::Version(args)) = &self.command {
+        let command = self.command_or_default();
+        if let Command::Version(args) = &command {
             args.run();
             return Ok(());
         }
 
         let context = AppContext::new(self.config.as_deref())?;
-        match &self.command {
-            Some(Command::Completions(args)) => {
-                args.run();
-                return Ok(());
+        match &command {
+            Command::Completions(args) => args.run(),
+            Command::Config(args) => args.run(&context)?,
+            command => {
+                let app = context.load_app()?;
+                run_with_app(command, &self.target_app(app, command)?)?;
             }
-            Some(Command::Config(args)) => return args.run(&context),
-            _ => {}
         }
+        Ok(())
+    }
 
-        let app = context.load_app()?;
-        let command = self.command_or_default();
-        let requirement = match &command {
-            Command::Shell(_)
-            | Command::Agent(_)
-            | Command::Opencode(_)
-            | Command::Claude(_)
-            | Command::Gemini(_) => Some(TargetRequirement::Running),
-            Command::Stop(_) | Command::Status(_) | Command::Tmp(_) | Command::Home(_) => {
-                Some(TargetRequirement::Any)
+    fn target_app(&self, app: App, command: &Command) -> Result<App> {
+        let Some(requirement) = target_requirement(command) else {
+            if self.container.is_some() {
+                return Err(Error::ContainerOptionUnsupported);
             }
-            _ => None,
+            return Ok(app);
         };
-        if self.container.is_some() && requirement.is_none() {
-            return Err(crate::error::Error::ContainerOptionUnsupported);
+        app.resolve_target(self.container.as_deref(), requirement)
+    }
+}
+
+const fn target_requirement(command: &Command) -> Option<TargetRequirement> {
+    match command {
+        Command::Shell(_)
+        | Command::Agent(_)
+        | Command::Opencode(_)
+        | Command::Claude(_)
+        | Command::Gemini(_) => Some(TargetRequirement::Running),
+        Command::Stop(_) | Command::Status(_) | Command::Tmp(_) | Command::Home(_) => {
+            Some(TargetRequirement::Any)
         }
-        let app = match requirement {
-            Some(requirement) => app.resolve_target(self.container.as_deref(), requirement)?,
-            None => app,
-        };
-        match command {
-            Command::Start(args) => args.run(&app),
-            Command::Stop(args) => args.run(&app),
-            Command::List(args) => args.run(&app),
-            Command::Status(args) => args.run(&app),
-            Command::Shell(_) => ShellArgs::run(&app),
-            Command::Agent(args) => args.run(&app),
-            Command::Pick(_) => PickArgs::run(&app),
-            Command::Opencode(_) => OpencodeArgs::run(&app),
-            Command::Claude(_) => ClaudeArgs::run(&app),
-            Command::Gemini(_) => GeminiArgs::run(&app),
-            Command::Tmp(_) => {
-                TmpArgs::run(&app);
-                Ok(())
-            }
-            Command::Home(_) => {
-                HomeArgs::run(&app);
-                Ok(())
-            }
-            Command::Version(_) | Command::Completions(_) | Command::Config(_) => Ok(()),
+        _ => None,
+    }
+}
+
+fn run_with_app(command: &Command, app: &App) -> Result<()> {
+    match command {
+        Command::Start(args) => args.run(app),
+        Command::Stop(args) => args.run(app),
+        Command::List(args) => args.run(app),
+        Command::Status(args) => args.run(app),
+        Command::Shell(_) => ShellArgs::run(app),
+        Command::Agent(args) => args.run(app),
+        Command::Pick(_) => PickArgs::run(app),
+        Command::Opencode(_) => OpencodeArgs::run(app),
+        Command::Claude(_) => ClaudeArgs::run(app),
+        Command::Gemini(_) => GeminiArgs::run(app),
+        Command::Tmp(_) => {
+            TmpArgs::run(app);
+            Ok(())
         }
+        Command::Home(_) => {
+            HomeArgs::run(app);
+            Ok(())
+        }
+        Command::Version(_) | Command::Completions(_) | Command::Config(_) => Ok(()),
     }
 }

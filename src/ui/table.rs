@@ -1,6 +1,6 @@
 use comfy_table::{Cell, ContentArrangement, Table, presets::NOTHING};
 
-use crate::app::{ContainerRow, MountSummary, ProjectReport};
+use crate::ui::report::{ContainerRow, MountSummary, ProjectReport};
 
 const TABLE_WIDTH: u16 = 120;
 

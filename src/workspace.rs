@@ -63,7 +63,37 @@ pub struct ProjectIdentity {
     pub host: HostIdentity,
 }
 
+struct RuntimePaths {
+    runtime: PathBuf,
+    home: PathBuf,
+    tmp: PathBuf,
+    meta: PathBuf,
+}
+
 impl ProjectIdentity {
+    fn from_parts(
+        project_dir: PathBuf,
+        name: String,
+        hash: String,
+        container_name: String,
+        host: HostIdentity,
+        paths: RuntimePaths,
+    ) -> Self {
+        let rootfs_dir = paths.meta.join("rootfs");
+        Self {
+            project_dir,
+            name,
+            hash,
+            container_name,
+            runtime_dir: paths.runtime,
+            home_dir: paths.home,
+            tmp_dir: paths.tmp,
+            meta_dir: paths.meta,
+            rootfs_dir,
+            host,
+        }
+    }
+
     /// Resolves the current directory into a stable project identity.
     pub fn resolve(home: &Path, config: &Config) -> Result<Self> {
         let current = env::current_dir().context(error::CurrentDirectorySnafu)?;
@@ -82,21 +112,9 @@ impl ProjectIdentity {
         let base = config::expand_path(Path::new(&config.general.runtime_base_dir), home);
         let host = HostIdentity::detect(home.to_path_buf())?;
         let container_name = format!("{}-{}-{}", config.general.container_prefix, name, hash);
-        let (runtime_dir, home_dir, tmp_dir, meta_dir) =
-            runtime_directories(&base, host.uid, &name, &hash);
+        let paths = runtime_directories(&base, host.uid, &name, &hash);
 
-        Ok(Self {
-            project_dir: project_dir.to_path_buf(),
-            name,
-            hash,
-            container_name,
-            runtime_dir,
-            tmp_dir,
-            home_dir,
-            rootfs_dir: meta_dir.join("rootfs"),
-            meta_dir,
-            host,
-        })
+        Ok(Self::from_parts(project_dir.to_path_buf(), name, hash, container_name, host, paths))
     }
 
     /// Builds the identity of an existing container selected outside its
@@ -123,37 +141,27 @@ impl ProjectIdentity {
         );
 
         let base = config::expand_path(Path::new(&config.general.runtime_base_dir), home);
-        let (runtime_dir, home_dir, tmp_dir, meta_dir) =
-            runtime_directories(&base, host.uid, name, hash);
+        let paths = runtime_directories(&base, host.uid, name, hash);
 
-        Ok(Self {
+        Ok(Self::from_parts(
             project_dir,
-            name: name.to_owned(),
-            hash: hash.to_owned(),
-            container_name: container_name.to_owned(),
-            runtime_dir,
-            tmp_dir,
-            home_dir,
-            rootfs_dir: meta_dir.join("rootfs"),
-            meta_dir,
-            host: host.clone(),
-        })
+            name.to_owned(),
+            hash.to_owned(),
+            container_name.to_owned(),
+            host.clone(),
+            paths,
+        ))
     }
 }
 
-fn runtime_directories(
-    base: &Path,
-    uid: u32,
-    name: &str,
-    hash: &str,
-) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+fn runtime_directories(base: &Path, uid: u32, name: &str, hash: &str) -> RuntimePaths {
     let runtime_dir = base.join(format!("{uid}-{name}-{hash}"));
-    (
-        runtime_dir.clone(),
-        runtime_dir.join("home"),
-        runtime_dir.join("tmp"),
-        runtime_dir.join("meta"),
-    )
+    RuntimePaths {
+        home: runtime_dir.join("home"),
+        tmp: runtime_dir.join("tmp"),
+        meta: runtime_dir.join("meta"),
+        runtime: runtime_dir,
+    }
 }
 
 /// Computes the stable eight-character project hash from a canonical absolute

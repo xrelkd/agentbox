@@ -520,16 +520,10 @@ impl Config {
         );
         for (name, agent) in &self.agents {
             if let Some(serve) = &agent.serve {
-                snafu::ensure!(
-                    !serve.command.is_empty() && !serve.attach.is_empty(),
-                    error::InvalidConfigSnafu {
-                        message: format!("agents.{name}.serve requires command and attach")
-                    }
-                );
-                validate_command(&serve.command)?;
-                validate_command(&serve.attach)?;
+                validate_command(&serve.command, &format!("agents.{name}.serve.command"))?;
+                validate_command(&serve.attach, &format!("agents.{name}.serve.attach"))?;
             }
-            validate_command(&agent.command)?;
+            validate_command(&agent.command, &format!("agents.{name}.command"))?;
         }
         Ok(())
     }
@@ -549,8 +543,14 @@ pub fn expand_path(input: &Path, home: &Path) -> PathBuf {
     PathBuf::from(expand_str(&input.to_string_lossy(), home))
 }
 
-#[inline]
-fn validate_command(command: &str) -> Result<()> { split_command(command).map(|_| ()) }
+fn validate_command(command: &str, field: &str) -> Result<()> {
+    let words = split_command(command)?;
+    snafu::ensure!(
+        !words.is_empty(),
+        error::InvalidConfigSnafu { message: format!("{field} must not be empty") }
+    );
+    Ok(())
+}
 
 /// Splits a configured command string into shell-quoted words.
 pub fn split_command(command: &str) -> Result<Vec<String>> {
@@ -755,6 +755,27 @@ general:
         let mut config = Config::default();
         config.agents.get_mut("claude").expect("claude agent").command =
             "claude --resume \"unclosed".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_agent_command() {
+        let mut config = Config::default();
+        config.agents.get_mut("claude").expect("claude agent").command = "   ".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_serve_command() {
+        let mut config = Config::default();
+        let serve = config
+            .agents
+            .get_mut("opencode")
+            .expect("opencode agent")
+            .serve
+            .as_mut()
+            .expect("opencode serve");
+        serve.command = "\t ".into();
         assert!(config.validate().is_err());
     }
 }

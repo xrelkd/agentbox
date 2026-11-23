@@ -3,9 +3,9 @@ use std::io::Write;
 use clap::{Args, Subcommand};
 
 use crate::{
-    cli::{error::Error, internal::context::AppContext},
+    cli::internal::context::AppContext,
     config::{Config, DEFAULT_CONFIG_TEMPLATE, FULL_CONFIG_TEMPLATE},
-    error::Result,
+    error::{Error, Result},
 };
 
 #[derive(Clone, Debug, Args)]

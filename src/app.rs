@@ -1,50 +1,30 @@
 use std::{
-    env,
     fmt::Write,
     fs::{self, Permissions},
     io::{self, IsTerminal},
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
     sync::OnceLock,
     time::Duration,
 };
 
 use indicatif::ProgressBar;
-use serde::Serialize;
 use snafu::{OptionExt, ResultExt};
 
+pub use crate::ui::report::{ContainerRow, ListReport, MountSummary, ProjectReport};
 use crate::{
-    cli::OutputFormat,
     config::{self, AgentServe, Config},
     consts::{CONTAINER_LOOPBACK, OCELOT_CONFIG_PATH, SERVE_MARKER_PREFIX},
+    container_plan::ContainerPlan,
     error::{self, Result},
     ocelot,
-    podman::{
-        ContainerInfo, ContainerSpec, ContainerStatus, Mount, PodmanClient, TcpProbe, Tmpfs,
-        shell_quote,
-    },
-    rootfs, ui,
+    output::OutputFormat,
+    podman::{ContainerInfo, ContainerSpec, ContainerStatus, PodmanClient, TcpProbe, shell_quote},
+    rootfs,
+    runtime::{InitMode, Runtime, init_script_for},
+    ui,
     workspace::{self, ProjectIdentity},
 };
-
-/// Init strategy selected for a container.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InitMode {
-    /// `ocelot supervise` is PID 1 and owns the long-lived services.
-    Ocelot,
-    /// Podman's host init is PID 1 and services start on demand.
-    Fallback,
-}
-
-impl InitMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ocelot => "ocelot",
-            Self::Fallback => "fallback",
-        }
-    }
-}
 
 /// Required state of a container selected outside its project directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,61 +33,6 @@ pub enum TargetRequirement {
     Any,
     /// Accept only running managed containers.
     Running,
-}
-
-/// Runtime facts returned when a container is started.
-#[derive(Clone, Debug)]
-struct Runtime {
-    mode: InitMode,
-    shell: String,
-    probe_shell: String,
-}
-
-/// A container row annotated with its relationship to the current project.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ContainerRow {
-    #[serde(flatten)]
-    pub info: ContainerInfo,
-    current: bool,
-}
-
-/// Read-only summary of a planned bind mount.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct MountSummary {
-    pub host: String,
-    pub container: String,
-    pub read_only: bool,
-}
-
-/// Derived facts about the current project directory.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ProjectReport {
-    pub dir: String,
-    pub name: String,
-    pub hash: String,
-    pub container: String,
-    pub container_state: String,
-    pub container_exit_code: String,
-    pub hostname: String,
-    pub home: String,
-    pub tmp: String,
-    pub meta: String,
-    pub rootfs: String,
-    pub config: String,
-    pub user: String,
-    pub uid: u32,
-    pub gid: u32,
-    pub shell: String,
-    pub init: String,
-    pub mounts: Vec<MountSummary>,
-    pub env: Vec<String>,
-}
-
-/// Payload emitted by `agentbox list --format json`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct ListReport {
-    containers: Vec<ContainerRow>,
-    project: ProjectReport,
 }
 
 fn agent_candidates(config: &Config) -> Vec<String> {
@@ -304,17 +229,18 @@ impl App {
             );
 
         let ai_env = self.expand_config_path(&self.config.general.ai_env_path);
-        let mounts = self
-            .build_mounts(&ai_env)
-            .into_iter()
+        let plan =
+            ContainerPlan::new(&self.config, &self.identity, &self.home, &ai_env, self.shell());
+        let mounts = plan
+            .mounts()
+            .iter()
             .map(|mount| MountSummary {
                 host: mount.host.display().to_string(),
                 container: mount.container.display().to_string(),
                 read_only: mount.read_only,
             })
             .collect();
-        let mut env =
-            self.build_env(self.shell()).into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        let mut env = plan.env_keys().cloned().collect::<Vec<_>>();
         env.extend(self.config.secrets.entries.keys().cloned());
 
         ProjectReport {
@@ -555,10 +481,7 @@ impl App {
         Ok(runtime)
     }
 
-    fn runtime(&self) -> Runtime {
-        let mode = if self.is_ocelot_available() { InitMode::Ocelot } else { InitMode::Fallback };
-        Runtime { mode, shell: self.shell().to_owned(), probe_shell: Self::init_shell() }
-    }
+    fn runtime(&self) -> Runtime { Runtime::detect(&self.config, &self.home, self.shell()) }
 
     fn build_attach_command(&self, agent_name: &str, serve: &AgentServe) -> Result<Vec<String>> {
         let mut command = config::split_command(&serve.attach)?;
@@ -570,12 +493,6 @@ impl App {
         );
         command.push(format!("http://{CONTAINER_LOOPBACK}:{}", self.config.server.serve_port));
         Ok(command)
-    }
-
-    fn is_ocelot_available(&self) -> bool {
-        let ai_env = self.expand_config_path(&self.config.general.ai_env_path);
-        let (_, host) = rootfs::resolve_tool(&self.config.general.ocelot_path, &ai_env);
-        is_executable(&host)
     }
 
     fn write_ocelot_config(&self, ai_env_path: &Path) -> Result<()> {
@@ -609,7 +526,7 @@ impl App {
         let serve_command =
             arguments.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>().join(" ");
         let script = format!("if [ ! -f {marker} ]; then touch {marker}; exec {serve_command}; fi");
-        let shell = Self::init_shell();
+        let shell = Runtime::init_shell();
         let command = [shell.as_str(), "-c", script.as_str()];
         let workdir = self.expand_config_path(&self.config.container.workdir);
         self.podman.exec_detached(&self.identity.container_name, &command, Some(&workdir))
@@ -627,9 +544,10 @@ impl App {
         let config = &self.config;
         let identity = &self.identity;
         let workdir = self.expand_config_path(&config.container.workdir);
-        let init_shell = Self::init_shell();
+        let init_shell = Runtime::init_shell();
         let (ocelot, _) = rootfs::resolve_tool(&config.general.ocelot_path, ai_env_path);
         let init_script = init_script_for(&init_shell, mode, &ocelot);
+        let plan = ContainerPlan::new(config, identity, &self.home, ai_env_path, self.shell());
 
         {
             let mut builder = ContainerSpec::builder(identity.container_name.clone())
@@ -657,163 +575,18 @@ impl App {
                 builder = builder.ulimit(name, value);
             }
 
-            for mount in self.build_mounts(ai_env_path) {
-                builder = builder.mount(mount);
+            for mount in plan.mounts() {
+                builder = builder.mount(mount.clone());
             }
-            for tmpfs in self.build_tmpfs() {
-                builder = builder.tmpfs(tmpfs);
+            for tmpfs in plan.tmpfs() {
+                builder = builder.tmpfs(tmpfs.clone());
             }
-            for (key, value) in self.build_env(self.shell()) {
-                builder = builder.env(key, value);
+            for (key, value) in plan.env() {
+                builder = builder.env(key.clone(), value.clone());
             }
             builder = builder.env_file(self.write_secret_env_file()?);
             builder.build()
         }
-    }
-
-    fn build_mounts(&self, ai_env_path: &Path) -> Vec<Mount> {
-        let config = &self.config;
-        let mut mounts = Vec::new();
-        let mut add = |host: PathBuf, container: PathBuf, read_only: bool| {
-            let mount = if read_only {
-                Mount::new(host, container, true)
-            } else {
-                Mount::with_options(host, container, false, "nosuid,nodev")
-            };
-            mounts.push(mount);
-        };
-
-        add(self.identity.home_dir.clone(), self.home.clone(), false);
-
-        let store = self.expand_config_path(&config.nix.store_path);
-        add(store.clone(), store, true);
-
-        if config.nix.enable_daemon_mount {
-            let socket_dir = self.expand_config_path(&config.nix.daemon_socket_dir);
-            if is_socket(&socket_dir.join("socket")) {
-                let container_socket = self.expand_config_path(&config.nix.daemon_socket_dir);
-                add(socket_dir, container_socket, false);
-                let profiles = self.expand_config_path(&config.nix.profiles_dir);
-                add(profiles.clone(), profiles, true);
-                let etc_nix = self.expand_config_path(&config.nix.etc_nix_dir);
-                add(etc_nix.clone(), etc_nix, true);
-            }
-        }
-
-        let mount_path = PathBuf::from(config::AI_ENV_MOUNT_PATH);
-        add(ai_env_path.to_path_buf(), mount_path, true);
-
-        if config.nix.mount_kernel_modules
-            && let Some(release) = kernel_release()
-        {
-            let host_modules = self.expand_config_path(&format!(
-                "{}/{}",
-                config.nix.kernel_modules_dir.trim_end_matches('/'),
-                release
-            ));
-            if host_modules.is_dir() {
-                let container_modules = PathBuf::from(format!(
-                    "{}/{}",
-                    config.nix.kernel_modules_mount_dir.trim_end_matches('/'),
-                    release
-                ));
-                add(host_modules, container_modules, true);
-            }
-        }
-
-        for entry in &config.mounts {
-            let host = self.expand_config_path(&entry.host);
-            if !host.exists() {
-                tracing::warn!("Skipping missing mount source {}", host.display());
-                continue;
-            }
-            add(host, self.expand_config_path(&entry.container), entry.read_only);
-        }
-
-        add(
-            self.identity.project_dir.clone(),
-            self.expand_config_path(&config.container.workdir),
-            false,
-        );
-        let config_dir = self.expand_config_path(&config.nix.host_config_dir);
-        let relative_config_dir = config_dir.strip_prefix(&self.home).unwrap_or(&config_dir);
-        add(self.identity.home_dir.join(relative_config_dir), config_dir, true);
-
-        mounts
-    }
-
-    fn build_tmpfs(&self) -> Vec<Tmpfs> {
-        vec![
-            Tmpfs::new(
-                PathBuf::from("/tmp"),
-                format!("rw,nosuid,nodev,mode=1777,size={}", self.config.container.tmp_size),
-            ),
-            Tmpfs::new(
-                PathBuf::from("/var/tmp"),
-                format!(
-                    "rw,nosuid,nodev,noexec,mode=1777,size={}",
-                    self.config.container.var_tmp_size
-                ),
-            ),
-        ]
-    }
-
-    fn build_env(&self, shell: &str) -> Vec<(String, String)> {
-        let config = &self.config;
-        let mut variables = Vec::new();
-
-        push_env(&mut variables, "HOME", self.home.display().to_string());
-        push_env(&mut variables, "USER", self.identity.host.username.clone());
-        push_env(&mut variables, "SHELL", shell.to_owned());
-        push_env(
-            &mut variables,
-            "HISTFILE",
-            self.expand_config_path(&config.environment.histfile).display().to_string(),
-        );
-        push_env(&mut variables, "PATH", self.expand_config_value(&config.environment.path));
-        push_env(
-            &mut variables,
-            "SSL_CERT_FILE",
-            self.expand_config_value(&config.environment.ssl_cert_file),
-        );
-        push_env(
-            &mut variables,
-            "NIX_SSL_CERT_FILE",
-            self.expand_config_value(&config.environment.ssl_cert_file),
-        );
-        push_env(&mut variables, "CPATH", self.expand_config_value(&config.environment.cpath));
-        push_env(
-            &mut variables,
-            "LIBRARY_PATH",
-            self.expand_config_value(&config.environment.library_path),
-        );
-        push_env(
-            &mut variables,
-            "PKG_CONFIG_PATH",
-            self.expand_config_value(&config.environment.pkg_config_path),
-        );
-        push_env(
-            &mut variables,
-            "NIX_REMOTE",
-            self.expand_config_value(&config.environment.nix_remote),
-        );
-        push_env(&mut variables, "LANG", config.environment.lang.clone());
-        push_env(&mut variables, "LC_ALL", config.environment.lang.clone());
-        push_env(
-            &mut variables,
-            "TERM",
-            env::var("TERM").unwrap_or_else(|_| config.environment.default_term.clone()),
-        );
-
-        variables.extend(
-            config
-                .environment
-                .extra_env
-                .iter()
-                .map(|(key, value)| (key.clone(), self.expand_config_value(value))),
-        );
-
-        variables
     }
 
     fn write_secret_env_file(&self) -> Result<PathBuf> {
@@ -848,61 +621,9 @@ impl App {
     }
 
     #[inline]
-    fn init_shell() -> String { format!("{}/bin/bash", config::AI_ENV_MOUNT_PATH) }
-
-    #[inline]
     fn expand_config_path(&self, raw: &str) -> PathBuf {
         config::expand_path(Path::new(raw), &self.home)
     }
-
-    #[inline]
-    fn expand_config_value(&self, raw: &str) -> String { config::expand_str(raw, &self.home) }
-}
-
-#[inline]
-fn push_env(variables: &mut Vec<(String, String)>, key: &str, value: String) {
-    variables.push((key.to_owned(), value));
-}
-
-#[inline]
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-fn init_script_for(init_shell: &str, mode: InitMode, ocelot_path: &str) -> String {
-    match mode {
-        InitMode::Ocelot => {
-            let file = shell_quote(OCELOT_CONFIG_PATH);
-            let ocelot = shell_quote(ocelot_path);
-            format!("exec {ocelot} supervise run --file {file}")
-        }
-        InitMode::Fallback => {
-            let shell = shell_quote(init_shell);
-            format!("exec {shell} -c {}", shell_quote("exec sleep infinity"))
-        }
-    }
-}
-
-#[inline]
-fn is_socket(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
-}
-
-fn kernel_release() -> Option<String> {
-    if let Ok(content) = fs::read_to_string("/proc/sys/kernel/osrelease") {
-        let release = content.trim();
-        if !release.is_empty() {
-            return Some(release.to_owned());
-        }
-    }
-
-    let output = Command::new("uname").arg("-r").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let release = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if release.is_empty() { None } else { Some(release) }
 }
 
 #[cfg(test)]
@@ -919,6 +640,7 @@ mod tests {
     };
     use crate::{
         config::{AgentServe, Config, MountEntry},
+        container_plan::ContainerPlan,
         error::Error,
         ocelot::render_config,
         podman::{ContainerInfo, PodmanClient},
@@ -949,6 +671,10 @@ mod tests {
         config.nix.enable_daemon_mount = false;
         config.nix.mount_kernel_modules = false;
         App::new(config, identity, home, PathBuf::from("/home/tester/.config/agentbox/config.yaml"))
+    }
+
+    fn container_plan(app: &App, ai_env_path: &Path) -> ContainerPlan {
+        ContainerPlan::new(&app.config, &app.identity, &app.home, ai_env_path, app.shell())
     }
 
     fn fake_podman(directory: &Path, body: &str) -> String {
@@ -990,7 +716,8 @@ mod tests {
         let temp = env::temp_dir();
         app.config.mounts =
             vec![MountEntry::new(temp.to_string_lossy(), "/home/tester/.agents", true)];
-        let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
+        let plan = container_plan(&app, Path::new("/nix/store/ai-env"));
+        let mounts = plan.mounts();
         let home_index =
             mounts.iter().position(|mount| mount.container == app.home).expect("home mount");
         let agents_index = mounts
@@ -1014,14 +741,17 @@ mod tests {
             MountEntry::new(temp.to_string_lossy(), "/home/tester/present", true),
         ];
 
-        let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
+        let plan = container_plan(&app, Path::new("/nix/store/ai-env"));
+        let mounts = plan.mounts();
         assert!(!mounts.iter().any(|mount| mount.container == app.home.join("missing")));
         assert!(mounts.iter().any(|mount| mount.container == app.home.join("present")));
     }
 
     #[test]
     fn temporary_directories_are_sized_tmpfs_mounts() {
-        let tmpfs = app().build_tmpfs();
+        let app = app();
+        let plan = container_plan(&app, Path::new("/nix/store/ai-env"));
+        let tmpfs = plan.tmpfs();
         assert_eq!(tmpfs.len(), 2);
         assert_eq!(tmpfs[0].target, PathBuf::from("/tmp"));
         assert_eq!(tmpfs[0].options, "rw,nosuid,nodev,mode=1777,size=2g");
@@ -1035,7 +765,8 @@ mod tests {
         let temp = env::temp_dir();
         app.config.mounts =
             vec![MountEntry::new(temp.to_string_lossy(), "/home/tester/.claude", true)];
-        let mounts = app.build_mounts(Path::new("/nix/store/ai-env"));
+        let plan = container_plan(&app, Path::new("/nix/store/ai-env"));
+        let mounts = plan.mounts();
         let config = mounts
             .iter()
             .find(|mount| mount.container == Path::new("/home/tester/.claude"))

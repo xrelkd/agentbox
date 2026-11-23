@@ -52,33 +52,26 @@ pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) 
 
     let rootfs = &identity.rootfs_dir;
     let workdir = Path::new(&config.container.workdir);
-    let relative_workdir = workdir.strip_prefix("/").unwrap_or(workdir);
+    let relative_workdir = rootfs_relative(workdir);
     for directory in ["bin", "usr/bin", "etc/ssl/certs", "run", "tmp", "var/tmp"] {
         create_dir_all(&rootfs.join(directory))?;
     }
     if !relative_workdir.as_os_str().is_empty() {
         create_dir_all(&rootfs.join(relative_workdir))?;
     }
-    let relative_home = home.strip_prefix("/").unwrap_or(home);
+    let relative_home = rootfs_relative(home);
     if !relative_home.as_os_str().is_empty() {
         create_dir_all(&rootfs.join(relative_home))?;
     }
 
-    let env_mount = config::AI_ENV_MOUNT_PATH;
-    ensure_symlink(rootfs.join("bin/sh"), &PathBuf::from(format!("{env_mount}/bin/sh")))?;
-    ensure_symlink(rootfs.join("usr/bin/env"), &PathBuf::from(format!("{env_mount}/bin/env")))?;
+    ensure_symlink(rootfs.join("bin/sh"), &ai_env_file("bin/sh"))?;
+    ensure_symlink(rootfs.join("usr/bin/env"), &ai_env_file("bin/env"))?;
     ensure_symlink(
         rootfs.join("etc/ssl/certs/ca-bundle.crt"),
-        &PathBuf::from(format!("{env_mount}/etc/ssl/certs/ca-bundle.crt")),
+        &ai_env_file("etc/ssl/certs/ca-bundle.crt"),
     )?;
-    ensure_symlink(
-        rootfs.join("etc/protocols"),
-        &PathBuf::from(format!("{env_mount}/etc/protocols")),
-    )?;
-    ensure_symlink(
-        rootfs.join("etc/services"),
-        &PathBuf::from(format!("{env_mount}/etc/services")),
-    )?;
+    ensure_symlink(rootfs.join("etc/protocols"), &ai_env_file("etc/protocols"))?;
+    ensure_symlink(rootfs.join("etc/services"), &ai_env_file("etc/services"))?;
 
     let shell = select_shell(config, ai_env_path);
     let passwd = format!(
@@ -154,7 +147,7 @@ pub fn select_shell(config: &Config, ai_env_path: &Path) -> String {
 }
 
 #[inline]
-fn is_executable(path: &Path) -> bool {
+pub fn is_executable(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
@@ -245,6 +238,12 @@ fn remove_stale_nix_config(target: &Path) -> Result<()> {
             .with_context(|_| error::RemoveFileSnafu { path: target.to_path_buf() })?;
     }
     Ok(())
+}
+
+fn rootfs_relative(path: &Path) -> &Path { path.strip_prefix("/").unwrap_or(path) }
+
+fn ai_env_file(path: &str) -> PathBuf {
+    Path::new(config::AI_ENV_MOUNT_PATH).join(path.trim_start_matches('/'))
 }
 
 fn filter_nix_config(content: &str) -> String {

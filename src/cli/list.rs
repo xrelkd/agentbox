@@ -1,6 +1,6 @@
-use clap::{Args, ValueEnum};
+use clap::Args;
 
-use crate::{app::App, error::Result};
+use crate::{app::App, error::Result, output::OutputFormat};
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct ListArgs {
@@ -11,13 +11,6 @@ pub struct ListArgs {
     /// Print only container names.
     #[arg(short, long, conflicts_with = "format")]
     pub quiet: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-pub enum OutputFormat {
-    #[default]
-    Table,
-    Json,
 }
 
 impl ListArgs {

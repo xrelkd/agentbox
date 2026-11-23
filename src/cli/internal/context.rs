@@ -4,7 +4,10 @@ use std::{
 };
 
 use crate::{
-    app::App, cli::error::Error, config::Config, error::Result, workspace::ProjectIdentity,
+    app::App,
+    config::Config,
+    error::{Error, Result},
+    workspace::ProjectIdentity,
 };
 
 pub struct AppContext {
