@@ -14,18 +14,20 @@ mod tests;
 
 use std::path::PathBuf;
 
-use agent::{AgentArgs, ClaudeArgs, GeminiArgs, OpencodeArgs, PickArgs};
 use clap::{ArgAction, Parser, Subcommand};
-use completions::CompletionsArgs;
-use config::ConfigArgs;
-use internal::context::AppContext;
-use list::ListArgs;
-use shell::{HomeArgs, ShellArgs, TmpArgs};
-use start::StartArgs;
-use status::StatusArgs;
-use stop::StopArgs;
-use version::VersionArgs;
 
+use self::{
+    agent::{AgentArgs, ClaudeArgs, GeminiArgs, OpencodeArgs, PickArgs},
+    completions::CompletionsArgs,
+    config::ConfigArgs,
+    internal::context::AppContext,
+    list::ListArgs,
+    shell::{HomeArgs, ShellArgs, TmpArgs},
+    start::StartArgs,
+    status::StatusArgs,
+    stop::StopArgs,
+    version::VersionArgs,
+};
 pub use crate::output::OutputFormat;
 use crate::{
     app::{App, TargetRequirement},
