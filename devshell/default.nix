@@ -21,39 +21,34 @@ pkgs.mkShell {
     darwin.apple_sdk.frameworks.SystemConfiguration
   ];
 
-  nativeBuildInputs =
-    with pkgs;
-    [
-      cargo-ext.cargo-build-all
-      cargo-ext.cargo-clippy-all
-      cargo-ext.cargo-doc-all
-      cargo-ext.cargo-nextest-all
-      cargo-ext.cargo-test-all
-      cargo-nextest
-      rustToolchain
+  nativeBuildInputs = with pkgs; [
+    cargo-ext.cargo-build-all
+    cargo-ext.cargo-clippy-all
+    cargo-ext.cargo-doc-all
+    cargo-ext.cargo-nextest-all
+    cargo-ext.cargo-test-all
+    cargo-nextest
+    rustToolchain
 
-      tokei
+    tokei
 
-      protobuf
+    protobuf
 
-      jq
+    jq
 
-      hclfmt
-      nixfmt
-      prettier
-      shfmt
-      taplo
-      treefmt
+    hclfmt
+    nixfmt
+    prettier
+    shfmt
+    taplo
+    treefmt
 
-      shellcheck
+    shellcheck
 
-      pkg-config
+    pkg-config
 
-      typos
-    ]
-    ++ lib.optionals stdenv.hostPlatform.isLinux [
-      xvfb-run
-    ];
+    typos
+  ];
 
   shellHook = ''
     export NIX_PATH="nixpkgs=${pkgs.path}"
