@@ -43,6 +43,9 @@ mounts:
   - host: "~/.config/opencode"
     container: "~/.config/opencode"
     read_only: false
+  - host: "~/.local/share/opencode"
+    container: "~/.local/share/opencode"
+    read_only: false
   - host: "~/.local/state/opencode"
     container: "~/.local/state/opencode"
     read_only: false

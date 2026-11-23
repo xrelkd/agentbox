@@ -194,6 +194,7 @@ fn create_persistent_home_path(
     create_dir_all(&home_dir.join(relative))
 }
 
+/// Seeds a filtered copy of `nix.conf`, following symlinks to regular files.
 fn seed_nix_config(config: &Config, identity: &ProjectIdentity) -> Result<()> {
     let home = &identity.host.home;
     let host_dir = config::expand_path(Path::new(&config.nix.host_config_dir), home);
@@ -208,7 +209,7 @@ fn seed_nix_config(config: &Config, identity: &ProjectIdentity) -> Result<()> {
     let target_dir = identity.home_dir.join(relative);
     let target = target_dir.join("nix.conf");
     let source = host_dir.join("nix.conf");
-    let metadata = match fs::symlink_metadata(&source) {
+    let metadata = match fs::metadata(&source) {
         Ok(metadata) => metadata,
         Err(source_error) if source_error.kind() == io::ErrorKind::NotFound => {
             return remove_stale_nix_config(&target);
@@ -469,15 +470,46 @@ mod tests {
     }
 
     #[test]
-    fn seed_nix_config_ignores_symlink_source() {
+    fn seed_nix_config_filters_symlink_source() {
         let root = test_root("seed-symlink");
         drop(fs::remove_dir_all(&root));
         let project = identity(&root);
         let host_config = project.host.home.join(".config/nix");
         fs::create_dir_all(&host_config).expect("create host config");
-        let secret = root.join("secret.conf");
-        fs::write(&secret, "access-tokens = github.com=secret\n").expect("write secret");
-        symlink(&secret, host_config.join("nix.conf")).expect("link secret");
+        let source = root.join("nix.conf");
+        fs::write(
+            &source,
+            concat!(
+                "experimental-features = nix-command flakes\n",
+                "access-tokens = github.com=secret\n",
+                "substituters = https://user:secret@example.org\n",
+            ),
+        )
+        .expect("write source config");
+        symlink(&source, host_config.join("nix.conf")).expect("link source config");
+        let target_dir = project.home_dir.join(".config/nix");
+        fs::create_dir_all(&target_dir).expect("create target dir");
+
+        seed_nix_config(&Config::default(), &project).expect("seed config");
+
+        let target = target_dir.join("nix.conf");
+        assert_eq!(
+            fs::read_to_string(&target).expect("read seeded config"),
+            "experimental-features = nix-command flakes\n"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn seed_nix_config_ignores_symlink_to_directory() {
+        let root = test_root("seed-symlink-dir");
+        drop(fs::remove_dir_all(&root));
+        let project = identity(&root);
+        let host_config = project.host.home.join(".config/nix");
+        fs::create_dir_all(&host_config).expect("create host config");
+        let directory = root.join("config-dir");
+        fs::create_dir_all(&directory).expect("create directory");
+        symlink(&directory, host_config.join("nix.conf")).expect("link directory");
         let target_dir = project.home_dir.join(".config/nix");
         fs::create_dir_all(&target_dir).expect("create target dir");
         let target = target_dir.join("nix.conf");

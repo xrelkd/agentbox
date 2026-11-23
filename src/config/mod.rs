@@ -321,7 +321,7 @@ fn default_mounts() -> Vec<MountEntry> {
         MountEntry::new("~/.claude/projects", "~/.claude/projects", false),
         MountEntry::new("~/.claude/todos", "~/.claude/todos", false),
         MountEntry::new("~/.config/opencode", "~/.config/opencode", true),
-        MountEntry::new("~/.local/share/opencode", "~/.local/share/opencode", true),
+        MountEntry::new("~/.local/share/opencode", "~/.local/share/opencode", false),
         MountEntry::new("~/.local/state/opencode", "~/.local/state/opencode", false),
         MountEntry::new("~/.gemini", "~/.gemini", true),
         MountEntry::new("~/.gemini/history", "~/.gemini/history", false),
