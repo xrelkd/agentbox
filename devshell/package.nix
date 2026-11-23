@@ -4,8 +4,6 @@
   lib,
   stdenv,
   rustPlatform,
-  pkg-config,
-  protobuf,
   installShellFiles,
   darwin,
 }:
@@ -27,9 +25,6 @@ rustPlatform.buildRustPackage {
   ];
 
   nativeBuildInputs = [
-    pkg-config
-    protobuf
-
     installShellFiles
   ];
 

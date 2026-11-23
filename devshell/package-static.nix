@@ -4,8 +4,6 @@
   lib,
   rustPlatform,
   installShellFiles,
-  pkg-config,
-  protobuf,
   completions ? null,
 }:
 
@@ -20,9 +18,7 @@ rustPlatform.buildRustPackage {
   };
 
   nativeBuildInputs = [
-    pkg-config
     installShellFiles
-    protobuf
   ];
 
   doCheck = false;
