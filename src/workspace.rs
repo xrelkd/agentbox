@@ -355,7 +355,10 @@ mod tests {
         assert_eq!(identity.hash, project_hash(Path::new("/tmp/work/my-project")));
         assert_eq!(
             identity.runtime_dir,
-            PathBuf::from(format!("/tmp/agentbox/1000-my-project-{}", identity.hash))
+            PathBuf::from(format!(
+                "/tmp/agentbox/{}-my-project-{}",
+                identity.host.uid, identity.hash
+            ))
         );
         assert_eq!(identity.home_dir, identity.runtime_dir.join("home"));
         assert_eq!(identity.tmp_dir, identity.runtime_dir.join("tmp"));
