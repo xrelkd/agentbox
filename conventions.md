@@ -8,16 +8,21 @@ These are the Rust conventions used in Agentbox.
 agentbox/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs       # Entrypoint and logging setup
-│   ├── cli.rs        # Clap definitions
-│   ├── config.rs     # YAML schema, defaults, expansion, validation
-│   ├── error.rs      # SNAFU error types
-│   ├── workspace.rs  # Project identity and path hashing
-│   ├── rootfs.rs     # Minimal rootfs construction
-│   ├── podman.rs     # Podman commands and container lifecycle
-│   └── app.rs        # Mount/env planning and session orchestration
-├── devshell/         # Nix packaging and dev shell
-└── .github/          # CI workflows
+│   ├── main.rs          # Entrypoint, module declarations, logging
+│   ├── app.rs           # App orchestration; app/report.rs and app/tests.rs
+│   ├── cli/             # Clap commands (mod.rs + one file per command)
+│   ├── config/          # YAML schema, defaults, expansion, validation
+│   ├── consts.rs        # Shared constants
+│   ├── error.rs         # SNAFU error types
+│   ├── output.rs        # Output format selection
+│   ├── podman.rs        # Podman commands and container lifecycle
+│   ├── rootfs.rs        # Minimal rootfs construction
+│   ├── session.rs       # Session facade; session/{plan,target,runtime,ocelot,toolchain}.rs
+│   ├── shell.rs         # POSIX shell quoting helper
+│   ├── ui/              # Report DTOs, table rendering, fuzzy picker
+│   └── workspace.rs     # Project identity and path hashing
+├── devshell/            # Nix packaging and dev shell
+└── .github/             # CI workflows
 ```
 
 Prefer refactoring an existing module over introducing a new crate.

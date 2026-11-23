@@ -41,19 +41,24 @@ cargo nextest run
 
 ## Project Structure
 
-| Path                 | Type          | Description                                          |
-| -------------------- | ------------- | ---------------------------------------------------- |
-| `src/main.rs`        | Binary module | Entrypoint, logging, config/completion fast paths    |
-| `src/cli.rs`         | Module        | Clap command definitions                             |
-| `src/config/mod.rs`  | Module        | YAML schema, defaults, expansion, validation         |
-| `src/error.rs`       | Module        | SNAFU error and result types                         |
-| `src/ocelot.rs`      | Module        | ocelot supervise config serialization                |
-| `src/workspace.rs`   | Module        | Canonical project identity and path hashing          |
-| `src/rootfs.rs`      | Module        | Minimal rootfs skeleton and symlinks                 |
-| `src/podman.rs`      | Module        | Container command construction and lifecycle         |
-| `src/app.rs`         | Module        | Mount/env planning and session orchestration         |
-| `devshell/`          | Nix           | Packages, dev shell, container, nfpm/tarball helpers |
-| `.github/workflows/` | CI            | Rust, lints, Nix, release, and container checks      |
+| Path                 | Type          | Description                                            |
+| -------------------- | ------------- | ------------------------------------------------------ |
+| `src/main.rs`        | Binary module | Entrypoint, module declarations, logging               |
+| `src/app.rs`         | Module        | Session orchestration; `app/report.rs`, `app/tests.rs` |
+| `src/cli/`           | Module        | Clap commands (`mod.rs` plus one file per command)     |
+| `src/config/`        | Module        | YAML schema, defaults, expansion, validation           |
+| `src/consts.rs`      | Module        | Shared constants                                       |
+| `src/error.rs`       | Module        | SNAFU error and result types                           |
+| `src/output.rs`      | Module        | Output format selection                                |
+| `src/podman.rs`      | Module        | Container command construction and lifecycle           |
+| `src/rootfs.rs`      | Module        | Minimal rootfs skeleton and symlinks                   |
+| `src/session.rs`     | Module        | Facade over plan/target/runtime/ocelot/toolchain       |
+| `src/session/`       | Submodules    | Container planning, targeting, init, config, tools     |
+| `src/shell.rs`       | Module        | POSIX shell quoting helper                             |
+| `src/ui/`            | Module        | Report DTOs, table rendering, fuzzy picker             |
+| `src/workspace.rs`   | Module        | Canonical project identity and path hashing            |
+| `devshell/`          | Nix           | Packages, dev shell, container, nfpm/tarball helpers   |
+| `.github/workflows/` | CI            | Rust, lints, Nix, release, and container checks        |
 
 ## Branch & Commit Convention
 
