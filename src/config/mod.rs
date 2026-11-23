@@ -121,7 +121,8 @@ pub struct NixConfig {
     pub kernel_modules_dir: String,
     /// Container directory where kernel modules are mounted.
     pub kernel_modules_mount_dir: String,
-    /// Host Nix configuration directory created and mounted read-only.
+    /// Host Nix configuration directory whose safe settings are filtered into
+    /// the per-project home.
     pub host_config_dir: String,
     /// Host Nix cache directory created before the container starts.
     pub host_cache_dir: String,

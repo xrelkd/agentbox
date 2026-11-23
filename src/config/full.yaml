@@ -81,8 +81,9 @@ nix:
   kernel_modules_dir: "/run/current-system/kernel-modules/lib/modules"
   # Container directory where kernel modules are mounted.
   kernel_modules_mount_dir: "/lib/modules"
-  # Nix configuration directory copied into the per-project home and mounted
-  # read-only; the real host directory is never exposed to the container.
+  # Host Nix configuration directory. Only an allowlist of safe nix.conf
+  # settings is copied into the per-project home and mounted read-only;
+  # credential-bearing settings and the real host directory are never exposed.
   host_config_dir: "~/.config/nix"
   # Host Nix cache directory created before the container starts.
   host_cache_dir: "~/.cache/nix"

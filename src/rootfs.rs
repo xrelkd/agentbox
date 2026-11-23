@@ -1,5 +1,7 @@
 use std::{
+    fmt::Write,
     fs::{self, Permissions},
+    io,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
@@ -12,6 +14,22 @@ use crate::{
     workspace::ProjectIdentity,
 };
 
+const MAX_NIX_CONFIG_BYTES: u64 = 256 * 1024;
+
+const NIX_CONFIG_ALLOWED_KEYS: &[&str] = &[
+    "connect-timeout",
+    "download-attempts",
+    "experimental-features",
+    "extra-experimental-features",
+    "extra-substituters",
+    "flake-registry",
+    "http-connections",
+    "substituters",
+    "warn-dirty",
+];
+
+const NIX_CONFIG_SECRET_MARKERS: &[&str] = &["@", "?sig=", "key=", "password", "secret", "token"];
+
 /// Creates the zero-image rootfs skeleton and returns the selected container
 /// shell.
 pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) -> Result<String> {
@@ -20,9 +38,10 @@ pub fn prepare(config: &Config, identity: &ProjectIdentity, ai_env_path: &Path) 
     create_private_dir(&identity.meta_dir)?;
     create_private_dir(&identity.home_dir)?;
 
-    let nix_config = &config::expand_path(Path::new(&config.nix.host_config_dir), home);
-    create_dir_all(nix_config)?;
+    let nix_config = config::expand_path(Path::new(&config.nix.host_config_dir), home);
+    create_dir_all(&nix_config)?;
     create_persistent_home_path(&identity.home_dir, &config.nix.host_config_dir, home, true)?;
+    seed_nix_config(config, identity)?;
     create_dir_all(&config::expand_path(Path::new(&config.nix.host_cache_dir), home))?;
 
     for mount in &config.mounts {
@@ -175,6 +194,78 @@ fn create_persistent_home_path(
     create_dir_all(&home_dir.join(relative))
 }
 
+fn seed_nix_config(config: &Config, identity: &ProjectIdentity) -> Result<()> {
+    let home = &identity.host.home;
+    let host_dir = config::expand_path(Path::new(&config.nix.host_config_dir), home);
+    let Ok(relative) = host_dir.strip_prefix(home) else {
+        tracing::warn!("Not copying Nix config from outside HOME: {}", host_dir.display());
+        return Ok(());
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let target_dir = identity.home_dir.join(relative);
+    let target = target_dir.join("nix.conf");
+    let source = host_dir.join("nix.conf");
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(source_error) if source_error.kind() == io::ErrorKind::NotFound => {
+            return remove_stale_nix_config(&target);
+        }
+        Err(source_error) => {
+            return Err(source_error)
+                .with_context(|_| error::ReadFileSnafu { path: source.clone() });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        tracing::warn!("Skipping non-regular Nix config source {}", source.display());
+        return remove_stale_nix_config(&target);
+    }
+    if metadata.len() > MAX_NIX_CONFIG_BYTES {
+        tracing::warn!("Skipping oversized Nix config {}", source.display());
+        return remove_stale_nix_config(&target);
+    }
+
+    let content = fs::read_to_string(&source)
+        .with_context(|_| error::ReadFileSnafu { path: source.clone() })?;
+    let temporary = target_dir.join(format!(".nix.conf.tmp-{}", std::process::id()));
+    fs::write(&temporary, filter_nix_config(&content))
+        .with_context(|_| error::WriteFileSnafu { path: temporary.clone() })?;
+    fs::set_permissions(&temporary, Permissions::from_mode(0o600))
+        .with_context(|_| error::SetPermissionsSnafu { path: temporary.clone() })?;
+    fs::rename(&temporary, &target)
+        .with_context(|_| error::RenameFileSnafu { from: temporary, to: target })
+}
+
+fn remove_stale_nix_config(target: &Path) -> Result<()> {
+    if fs::symlink_metadata(target).is_ok() {
+        fs::remove_file(target)
+            .with_context(|_| error::RemoveFileSnafu { path: target.to_path_buf() })?;
+    }
+    Ok(())
+}
+
+fn filter_nix_config(content: &str) -> String {
+    let mut output = String::new();
+    for line in content.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        let lowered = value.to_ascii_lowercase();
+        if !NIX_CONFIG_ALLOWED_KEYS.contains(&key)
+            || NIX_CONFIG_SECRET_MARKERS.iter().any(|marker| lowered.contains(marker))
+        {
+            tracing::debug!("Skipping Nix config setting `{key}`");
+            continue;
+        }
+        let _ = writeln!(output, "{key} = {value}");
+    }
+    output
+}
+
 #[inline]
 fn write_file(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).with_context(|_| error::WriteFileSnafu { path: path.to_path_buf() })
@@ -207,11 +298,13 @@ fn ensure_symlink(link: PathBuf, target: &Path) -> Result<()> {
 mod tests {
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{PermissionsExt, symlink},
         path::{Path, PathBuf},
     };
 
-    use super::{container_path_to_host, prepare, resolve_tool};
+    use super::{
+        container_path_to_host, filter_nix_config, prepare, resolve_tool, seed_nix_config,
+    };
     use crate::{
         config::Config,
         workspace::{HostIdentity, ProjectIdentity},
@@ -307,6 +400,92 @@ mod tests {
         assert!(!root.join("home/.agents").is_dir());
         assert!(!root.join("agentbox-tmp").is_dir());
 
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn filter_nix_config_keeps_only_safe_settings() {
+        let source = concat!(
+            "# comment\n",
+            "experimental-features = nix-command flakes\n",
+            "extra-substituters = https://cache.example.org\n",
+            "access-tokens = github.com=ghp_secret\n",
+            "secret-key-files = /run/secrets/key\n",
+            "netrc-file = /home/tester/.netrc\n",
+            "builders = ssh://builder\n",
+            "include /etc/nix/extra.conf\n",
+            "substituters = https://user:pass@private.example.org\n",
+            "warn-dirty = false\n",
+        );
+        assert_eq!(
+            filter_nix_config(source),
+            concat!(
+                "experimental-features = nix-command flakes\n",
+                "extra-substituters = https://cache.example.org\n",
+                "warn-dirty = false\n",
+            )
+        );
+    }
+
+    #[test]
+    fn seed_nix_config_copies_filtered_settings() {
+        let root = test_root("seed-config");
+        drop(fs::remove_dir_all(&root));
+        let project = identity(&root);
+        let host_config = project.host.home.join(".config/nix");
+        fs::create_dir_all(&host_config).expect("create host config");
+        fs::write(
+            host_config.join("nix.conf"),
+            "experimental-features = nix-command flakes\naccess-tokens = github.com=secret\n",
+        )
+        .expect("write host config");
+        fs::create_dir_all(project.home_dir.join(".config/nix")).expect("create target dir");
+
+        seed_nix_config(&Config::default(), &project).expect("seed config");
+
+        let target = project.home_dir.join(".config/nix/nix.conf");
+        assert_eq!(
+            fs::read_to_string(&target).expect("read seeded config"),
+            "experimental-features = nix-command flakes\n"
+        );
+        assert_eq!(fs::metadata(&target).expect("metadata").permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn seed_nix_config_removes_stale_copy_without_source() {
+        let root = test_root("seed-stale");
+        drop(fs::remove_dir_all(&root));
+        let project = identity(&root);
+        let target_dir = project.home_dir.join(".config/nix");
+        fs::create_dir_all(&target_dir).expect("create target dir");
+        let target = target_dir.join("nix.conf");
+        fs::write(&target, "experimental-features = flakes\n").expect("write stale config");
+
+        seed_nix_config(&Config::default(), &project).expect("seed config");
+
+        assert!(fs::symlink_metadata(&target).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn seed_nix_config_ignores_symlink_source() {
+        let root = test_root("seed-symlink");
+        drop(fs::remove_dir_all(&root));
+        let project = identity(&root);
+        let host_config = project.host.home.join(".config/nix");
+        fs::create_dir_all(&host_config).expect("create host config");
+        let secret = root.join("secret.conf");
+        fs::write(&secret, "access-tokens = github.com=secret\n").expect("write secret");
+        symlink(&secret, host_config.join("nix.conf")).expect("link secret");
+        let target_dir = project.home_dir.join(".config/nix");
+        fs::create_dir_all(&target_dir).expect("create target dir");
+        let target = target_dir.join("nix.conf");
+        fs::write(&target, "stale\n").expect("write stale config");
+
+        seed_nix_config(&Config::default(), &project).expect("seed config");
+
+        assert!(fs::symlink_metadata(&target).is_err());
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

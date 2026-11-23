@@ -78,6 +78,9 @@ pub enum Error {
     #[snafu(display("Could not create directory `{}`: {source}", path.display()))]
     CreateDir { path: PathBuf, source: std::io::Error },
 
+    #[snafu(display("Could not read file `{}`: {source}", path.display()))]
+    ReadFile { path: PathBuf, source: std::io::Error },
+
     #[snafu(display("Could not write file `{}`: {source}", path.display()))]
     WriteFile { path: PathBuf, source: std::io::Error },
 
